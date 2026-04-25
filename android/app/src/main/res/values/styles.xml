@@ -5,6 +5,15 @@
         <!-- Show a splash screen on the activity. Automatically removed when
              the Flutter engine draws its first frame -->
         <item name="android:windowBackground">@drawable/launch_background</item>
+        <item name="android:forceDarkAllowed">false</item>
+        <item name="android:windowFullscreen">false</item>
+        <!-- Ensure system bars are white during Flutter splash -->
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/white</item>
+        <item name="android:navigationBarColor">@android:color/white</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
     </style>
     <!-- Theme applied to the Android Window as soon as the process has started.
          This theme determines the color of the Android Window while your
@@ -14,5 +23,23 @@
          This Theme is only used starting with V2 of Flutter's Android embedding. -->
     <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
         <item name="android:windowBackground">?android:colorBackground</item>
+        <!-- Ensure system bars are white while Flutter UI initializes -->
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/white</item>
+        <item name="android:navigationBarColor">@android:color/white</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+
+    <!--
+      对话框宿主主题：完整的 Material 3 Theme，仅用于包装对话框 Context。
+      因为 NativeWebViewActivity 继承 ComponentActivity 且基础主题不是 Material，
+      必须通过 ContextThemeWrapper 提供完整的 Material 3 属性集合，否则
+      MaterialAlertDialogBuilder 在运行时解析 colorSurface / materialAlertDialogTheme
+      等属性会失败而崩溃。仅作用于对话框，不影响 Activity 外观。
+    -->
+    <style name="Theme.Liminal.Dialog.Host" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">#1A73E8</item>
+        <item name="colorOnPrimary">@android:color/white</item>
     </style>
 </resources>

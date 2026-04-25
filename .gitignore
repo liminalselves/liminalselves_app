@@ -1,3 +1,8 @@
+# Editor / local tooling
+.cursor/
+.vscode/
+lib/misskey.code-workspace
+
 # Miscellaneous
 *.class
 *.log
@@ -43,3 +48,8 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Release signing — 勿提交密钥与本地配置
+android/key.properties
+**/*.jks
+**/*.keystore

@@ -1,0 +1,8 @@
+# 复制本文件为 android/key.properties 并填写真实值。
+# key.properties 与 .jks 已在 .gitignore 中，勿提交仓库。
+
+storePassword=填写密钥库密码
+keyPassword=填写密钥密码（常与 storePassword 相同）
+keyAlias=upload
+# 相对 android 目录的路径；也可写绝对路径
+storeFile=upload-keystore.jks

@@ -1,8 +1,29 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- WebView 文件选择与 `<input capture>` 拍照 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Android 13+ 通知权限（阿里云推送 SDK 3.8.4+ 会处理，此处显式声明） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:label="阈界人格"
-        android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:name=".LiminalApplication"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:extractNativeLibs="true"
+        android:usesCleartextTraffic="true">
+        <!-- WebView 为 PlatformView：Impeller 与 Android PlatformView/纹理组合时常比 Skia 更顿挫（如 flutter/flutter#180831）。全屏 WebView 壳优先 Skia。 -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableImpeller"
+            android:value="false" />
+        <!-- Aliyun Push: 使用官方推荐的 Manifest + init(context) 方式初始化 -->
+        <meta-data
+            android:name="com.alibaba.app.appkey"
+            android:value="335689498" />
+        <meta-data
+            android:name="com.alibaba.app.appsecret"
+            android:value="d1256735abf9469d8ce1a35966510e91" />
+        <!-- 线上建议改为安全方案（如后端下发/加固），此处为当前可运行配置。 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -25,6 +46,26 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <activity
+            android:name=".NativeWebViewActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:theme="@style/NormalTheme"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize" />
+        <service
+            android:name=".KeepAliveService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

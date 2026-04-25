@@ -12,3 +12,6 @@ GeneratedPluginRegistrant.java
 key.properties
 **/*.keystore
 **/*.jks
+
+# EMAS 控制台下载，含 AppSecret / 各服务密钥，勿提交
+app/src/main/assets/aliyun-emas-services.json

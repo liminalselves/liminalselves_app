@@ -1,0 +1,9 @@
+{
+  "config": {
+    "emas.appKey": "YOUR_EMAS_APP_KEY",
+    "emas.appSecret": "YOUR_EMAS_APP_SECRET",
+    "emas.packageName": "top.liminalselves.app"
+  },
+  "services": {},
+  "use_maven": true
+}
