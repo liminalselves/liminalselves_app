@@ -12,6 +12,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -21,6 +23,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -30,11 +33,15 @@ import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceError
+import android.webkit.WebResourceResponse
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.ComponentActivity
@@ -54,6 +61,7 @@ import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.Executors
 
 class NativeWebViewActivity : ComponentActivity() {
     private data class ApiCallResult(
@@ -64,12 +72,21 @@ class NativeWebViewActivity : ComponentActivity() {
     private lateinit var swipeRefresh: TopEdgeSwipeRefreshLayout
     private lateinit var webView: WebView
     private lateinit var progressBar: ProgressBar
+    private lateinit var errorOverlay: View
+    private lateinit var errorUrlText: TextView
+    private lateinit var errorMetaText: TextView
+    private val defaultUrl = BuildConfig.MISSKEY_URL.ifBlank {
+        "https://misskey.liminalselves.top/"
+    }
+    private val ioExecutor = Executors.newFixedThreadPool(2)
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var cameraOutputUri: Uri? = null
     private var nativePushRestoreAttempted = false
     private var startupPermissionChecked = false
     private var pendingNotificationPermissionFromStartup = false
-    private var currentUrl: String = DEFAULT_URL
+    private var currentUrl: String = defaultUrl
+    private var showingErrorPage = false
+    private var loadFailedForCurrentNavigation = false
 
     /** 无 WebView 历史可退时：首次返回仅提示，短时内第二次返回才 [finish]。 */
     private var lastExitBackPressElapsed = 0L
@@ -94,6 +111,11 @@ class NativeWebViewActivity : ComponentActivity() {
         val c = pendingChromeColor ?: return@Runnable
         pendingChromeColor = null
         applyChromeColorNow(c)
+    }
+    private val refreshChromeColorRunnable = Runnable {
+        if (!isFinishing && !isDestroyed && ::webView.isInitialized) {
+            updateChromeColorFromWebPage()
+        }
     }
 
     private val fileChooserLauncher =
@@ -133,6 +155,7 @@ class NativeWebViewActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         overridePendingTransition(0, 0)
         setupSystemBars()
+        applyWindowRefreshPresentationHints()
         applyPersistentSystemBars()
         setupViews()
         setupWebView()
@@ -160,7 +183,7 @@ class NativeWebViewActivity : ComponentActivity() {
         })
         val url = resolveLaunchUrl(intent)
         currentUrl = url
-        webView.loadUrl(url)
+        loadUrl(url)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -170,7 +193,7 @@ class NativeWebViewActivity : ComponentActivity() {
         val url = resolveLaunchUrl(intent)
         if (url.isBlank()) return
         currentUrl = url
-        webView.loadUrl(url)
+        loadUrl(url)
     }
 
     /**
@@ -179,11 +202,11 @@ class NativeWebViewActivity : ComponentActivity() {
      */
     private fun resolveLaunchUrl(incoming: Intent): String {
         incoming.getStringExtra(EXTRA_URL)?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
-        val raw = incoming.getStringExtra("extraMap") ?: return DEFAULT_URL
+        val raw = incoming.getStringExtra("extraMap") ?: return defaultUrl
         val openUrl = runCatching {
             JSONObject(raw).optString("openUrl", "").trim()
         }.getOrNull().orEmpty()
-        if (openUrl.isEmpty() || !isTrustedMisskeyOpenUrl(openUrl)) return DEFAULT_URL
+        if (openUrl.isEmpty() || !isTrustedMisskeyOpenUrl(openUrl)) return defaultUrl
         return openUrl
     }
 
@@ -192,7 +215,7 @@ class NativeWebViewActivity : ComponentActivity() {
         val scheme = u.scheme ?: return false
         if (scheme != "http" && scheme != "https") return false
         val host = u.host ?: return false
-        val defHost = Uri.parse(DEFAULT_URL).host
+        val defHost = Uri.parse(defaultUrl).host
         if (host == defHost) return true
         val stored = getPrefs().getString(PREF_LAST_MISSKEY_ORIGIN, null) ?: return false
         val sh = runCatching { Uri.parse(stored).host }.getOrNull() ?: return false
@@ -223,6 +246,22 @@ class NativeWebViewActivity : ComponentActivity() {
             // 避免系统为“对比度增强”强行把导航栏改成白/灰（部分 ROM 会触发）。
             window.isNavigationBarContrastEnforced = false
             window.isStatusBarContrastEnforced = false
+        }
+    }
+
+    private fun applyWindowRefreshPresentationHints() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        runCatching {
+            val currentDisplay = display ?: return
+            val maxHz = currentDisplay.supportedModes.maxOfOrNull { it.refreshRate }
+                ?: currentDisplay.refreshRate
+            val attrs = window.attributes
+            if (attrs.preferredRefreshRate != maxHz) {
+                attrs.preferredRefreshRate = maxHz
+                window.attributes = attrs
+            }
+        }.onFailure {
+            Log.w(TAG, "preferredRefreshRate: ${it.message}")
         }
     }
 
@@ -271,11 +310,13 @@ class NativeWebViewActivity : ComponentActivity() {
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 currentUrl = url ?: currentUrl
+                loadFailedForCurrentNavigation = false
                 swipeRefresh.isRefreshing = true
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 swipeRefresh.isRefreshing = false
+                if (loadFailedForCurrentNavigation) return
                 persistTrustedMisskeyOrigin(url)
                 installChromeColorSyncBridge()
                 updateChromeColorFromWebPage()
@@ -291,7 +332,33 @@ class NativeWebViewActivity : ComponentActivity() {
                 error: WebResourceError?,
             ) {
                 if (request?.isForMainFrame == true) {
-                    swipeRefresh.isRefreshing = false
+                    loadFailedForCurrentNavigation = true
+                    val failingUrl = request.url?.toString().orEmpty().ifBlank { currentUrl }
+                    showLoadErrorPage(
+                        view,
+                        failingUrl,
+                        error?.errorCode?.toString().orEmpty(),
+                        error?.description?.toString().orEmpty(),
+                    )
+                }
+            }
+
+            override fun onReceivedHttpError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                errorResponse: WebResourceResponse?,
+            ) {
+                if (request?.isForMainFrame == true) {
+                    loadFailedForCurrentNavigation = true
+                    val failingUrl = request.url?.toString().orEmpty().ifBlank { currentUrl }
+                    val statusCode = errorResponse?.statusCode ?: -1
+                    val reason = errorResponse?.reasonPhrase.orEmpty()
+                    showLoadErrorPage(
+                        view,
+                        failingUrl,
+                        statusCode.toString(),
+                        if (reason.isBlank()) "HTTP response code failure" else reason,
+                    )
                 }
             }
 
@@ -299,7 +366,12 @@ class NativeWebViewActivity : ComponentActivity() {
                 view: WebView?,
                 detail: RenderProcessGoneDetail?,
             ): Boolean {
-                Log.w(TAG, "WebView render process gone. didCrash=${detail?.didCrash()}")
+                val didCrash = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    detail?.didCrash()
+                } else {
+                    null
+                }
+                Log.w(TAG, "WebView render process gone. didCrash=$didCrash")
                 swipeRefresh.isRefreshing = false
                 view?.destroy()
                 recreateWebViewAndReload()
@@ -345,7 +417,9 @@ class NativeWebViewActivity : ComponentActivity() {
             setProgressBackgroundColorSchemeColor(Color.WHITE)
             // 只下移刷新指示器位置，保持当前触发/回弹手感不变。
             setProgressViewOffset(false, dp(18), dp(62))
-            setOnRefreshListener { webView.reload() }
+            setOnRefreshListener {
+                retryFromErrorPage()
+            }
         }
         // 透明状态栏下，把安全区显式变成顶部 padding，避免刘海/状态栏遮挡内容。
         swipeRefresh.setBackgroundColor(defaultChromeColor)
@@ -384,6 +458,14 @@ class NativeWebViewActivity : ComponentActivity() {
                 dp(2),
             ),
         )
+        errorOverlay = buildErrorOverlay()
+        frame.addView(
+            errorOverlay,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
         swipeRefresh.addView(
             frame,
             ViewGroup.LayoutParams(
@@ -392,6 +474,168 @@ class NativeWebViewActivity : ComponentActivity() {
             ),
         )
         setContentView(swipeRefresh)
+    }
+
+    private fun buildErrorOverlay(): View {
+        val root = FrameLayout(this).apply {
+            setBackgroundColor(defaultChromeColor)
+            visibility = View.GONE
+            isClickable = true
+            isFocusable = true
+        }
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(24), dp(30), dp(24), dp(28))
+        }
+
+        val mark = TextView(this).apply {
+            text = "!"
+            gravity = Gravity.CENTER
+            textSize = 30f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(accentColor)
+            background = roundedRect(Color.WHITE, dp(28), Color.parseColor("#E5EAF1"), 1)
+        }
+        content.addView(
+            mark,
+            LinearLayout.LayoutParams(dp(78), dp(78)).apply {
+                bottomMargin = dp(22)
+            },
+        )
+
+        content.addView(
+            TextView(this).apply {
+                text = "暂时无法连接"
+                gravity = Gravity.CENTER
+                textSize = 24f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.parseColor("#162033"))
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+
+        content.addView(
+            TextView(this).apply {
+                text = "页面没有成功加载。请检查网络状态，或稍后重试。"
+                gravity = Gravity.CENTER
+                textSize = 15f
+                setTextColor(Color.parseColor("#637083"))
+                setLineSpacing(0f, 1.18f)
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                topMargin = dp(12)
+            },
+        )
+
+        errorUrlText = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.parseColor("#405064"))
+            setLineSpacing(0f, 1.12f)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = roundedRect(Color.WHITE, dp(8), Color.parseColor("#E5EAF1"), 1)
+        }
+        content.addView(
+            errorUrlText,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                topMargin = dp(22)
+            },
+        )
+
+        errorMetaText = TextView(this).apply {
+            gravity = Gravity.CENTER
+            textSize = 12f
+            setTextColor(Color.parseColor("#8A95A6"))
+        }
+        content.addView(
+            errorMetaText,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                topMargin = dp(10)
+            },
+        )
+
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        actions.addView(
+            makeErrorButton("浏览器打开", primary = false) {
+                runCatching { openExternal(Uri.parse(currentUrl)) }
+            },
+            LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+                marginEnd = dp(5)
+            },
+        )
+        actions.addView(
+            makeErrorButton("重试", primary = true) { retryFromErrorPage() },
+            LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+                marginStart = dp(5)
+            },
+        )
+        content.addView(
+            actions,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                topMargin = dp(26)
+            },
+        )
+
+        root.addView(
+            content,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER,
+            ),
+        )
+        return root
+    }
+
+    private fun makeErrorButton(label: String, primary: Boolean, onClick: () -> Unit): Button {
+        return Button(this).apply {
+            text = label
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            isAllCaps = false
+            setTextColor(if (primary) Color.WHITE else accentColorDark)
+            background = if (primary) {
+                roundedRect(accentColor, dp(8), accentColor, 0)
+            } else {
+                roundedRect(Color.parseColor("#EAF2FF"), dp(8), Color.TRANSPARENT, 0)
+            }
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun roundedRect(
+        fill: Int,
+        radiusPx: Int,
+        strokeColor: Int,
+        strokeWidthPx: Int,
+    ): GradientDrawable {
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(fill)
+            cornerRadius = radiusPx.toFloat()
+            if (strokeWidthPx > 0) {
+                setStroke(strokeWidthPx, strokeColor)
+            }
+        }
     }
 
     /**
@@ -434,7 +678,7 @@ class NativeWebViewActivity : ComponentActivity() {
     private fun recreateWebViewAndReload() {
         setupViews()
         setupWebView()
-        webView.loadUrl(currentUrl)
+        loadUrl(currentUrl)
     }
 
     private fun updateChromeColorFromWebPage() {
@@ -514,24 +758,37 @@ class NativeWebViewActivity : ComponentActivity() {
                 } catch (_) {}
                 return '';
               }
+              var lastColor = '';
+              var pending = 0;
               function notify() {
                 try {
                   var c = pickColor();
+                  if (c === lastColor) return;
+                  lastColor = c;
                   if (window.AppChrome && window.AppChrome.postColor) {
                     window.AppChrome.postColor(c || '');
                   }
                 } catch (_) {}
               }
+              function scheduleNotify() {
+                if (pending) clearTimeout(pending);
+                pending = setTimeout(function() {
+                  pending = 0;
+                  notify();
+                }, 160);
+              }
               // 恢复/首次渲染期经常先拿到透明色，做 2 帧重试。
               notify();
-              requestAnimationFrame(function(){ notify(); });
-              requestAnimationFrame(function(){ requestAnimationFrame(function(){ notify(); }); });
-              var mo = new MutationObserver(function(){ notify(); });
-              mo.observe(document.documentElement || document.body, {attributes:true, childList:true, subtree:true});
-              document.addEventListener('visibilitychange', notify, true);
-              window.addEventListener('focus', notify, true);
-              window.addEventListener('pageshow', notify, true);
-              setInterval(notify, 1200);
+              requestAnimationFrame(scheduleNotify);
+              var mo = new MutationObserver(scheduleNotify);
+              var options = {attributes:true, attributeFilter:['class', 'style', 'data-theme']};
+              if (document.documentElement) mo.observe(document.documentElement, options);
+              if (document.body) mo.observe(document.body, options);
+              document.addEventListener('visibilitychange', function() {
+                if (!document.hidden) scheduleNotify();
+              }, true);
+              window.addEventListener('focus', scheduleNotify, true);
+              window.addEventListener('pageshow', scheduleNotify, true);
             })();
         """.trimIndent()
         webView.evaluateJavascript(js, null)
@@ -578,9 +835,77 @@ class NativeWebViewActivity : ComponentActivity() {
 
     private fun openExternal(uri: Uri) {
         try {
-            startActivity(Intent(Intent.ACTION_VIEW, uri))
+            startActivity(Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE))
         } catch (_: ActivityNotFoundException) {
             // ignore
+        }
+    }
+
+    private fun showLoadErrorPage(
+        view: WebView?,
+        failingUrl: String,
+        code: String,
+        description: String,
+    ) {
+        if (failingUrl.startsWith("data:", ignoreCase = true)) return
+        loadFailedForCurrentNavigation = true
+        showingErrorPage = true
+        currentUrl = failingUrl
+        swipeRefresh.isRefreshing = false
+        progressBar.visibility = View.GONE
+        view?.stopLoading()
+        webView.visibility = View.INVISIBLE
+        applySystemBarColor(defaultChromeColor)
+        if (::errorOverlay.isInitialized) {
+            errorUrlText.text = failingUrl
+            errorMetaText.text = formatLoadError(code, description)
+            errorOverlay.visibility = View.VISIBLE
+            errorOverlay.bringToFront()
+        }
+    }
+
+    private fun hideLoadErrorPage() {
+        if (::webView.isInitialized) {
+            webView.visibility = View.VISIBLE
+        }
+        if (::errorOverlay.isInitialized) {
+            errorOverlay.visibility = View.GONE
+        }
+        showingErrorPage = false
+    }
+
+    private fun retryFromErrorPage() {
+        loadUrl(currentUrl)
+    }
+
+    private fun loadUrl(url: String) {
+        val target = url.ifBlank { defaultUrl }
+        currentUrl = target
+        hideLoadErrorPage()
+        loadFailedForCurrentNavigation = false
+        webView.visibility = View.VISIBLE
+        swipeRefresh.isRefreshing = true
+        progressBar.progress = 5
+        progressBar.visibility = View.VISIBLE
+        webView.stopLoading()
+        webView.loadUrl(target)
+    }
+
+    private fun formatLoadError(code: String, description: String): String {
+        val trimmedCode = code.trim()
+        val trimmedDescription = description.trim()
+        val httpCode = trimmedCode.toIntOrNull()
+        if (httpCode != null && httpCode > 0) {
+            return "HTTP ERROR $httpCode"
+        }
+        return when {
+            trimmedCode.equals("NETWORK", ignoreCase = true) -> "网络连接失败"
+            trimmedDescription.contains("ERR_HTTP_RESPONSE_CODE_FAILURE", ignoreCase = true) -> "HTTP ERROR"
+            trimmedDescription.contains("java.lang.", ignoreCase = true) -> "网络连接失败"
+            trimmedDescription.contains("Throwable", ignoreCase = true) -> "网络连接失败"
+            trimmedDescription.isNotBlank() -> trimmedDescription.take(80)
+            trimmedCode.isNotBlank() -> trimmedCode.take(80)
+            else -> "页面暂时无法加载"
         }
     }
 
@@ -793,7 +1118,7 @@ class NativeWebViewActivity : ComponentActivity() {
 
     private fun absoluteUrlForMisskeyPath(path: String): String {
         val u = Uri.parse(currentUrl)
-        val def = Uri.parse(DEFAULT_URL)
+        val def = Uri.parse(defaultUrl)
         val scheme = u.scheme ?: def.scheme ?: "https"
         val host = u.host ?: def.host ?: return def.toString().trimEnd('/')
         val port = u.port
@@ -872,7 +1197,7 @@ class NativeWebViewActivity : ComponentActivity() {
                 cb(false)
                 return@readMisskeyToken
             }
-            Thread {
+            ioExecutor.execute {
                 val result = callMisskeyPushApi(
                     "$origin/api/mobile-push/register",
                     token,
@@ -882,8 +1207,10 @@ class NativeWebViewActivity : ComponentActivity() {
                         put("platform", "android")
                     },
                 )
-                mainHandler.post { cb(result.ok) }
-            }.start()
+                mainHandler.post {
+                    if (!isFinishing && !isDestroyed) cb(result.ok)
+                }
+            }
         }
     }
 
@@ -894,7 +1221,7 @@ class NativeWebViewActivity : ComponentActivity() {
                 cb(false)
                 return@readMisskeyToken
             }
-            Thread {
+            ioExecutor.execute {
                 val result = callMisskeyPushApi(
                     "$origin/api/i/update",
                     token,
@@ -903,8 +1230,10 @@ class NativeWebViewActivity : ComponentActivity() {
                         put("enableAppPush", enabled)
                     },
                 )
-                mainHandler.post { cb(result.ok) }
-            }.start()
+                mainHandler.post {
+                    if (!isFinishing && !isDestroyed) cb(result.ok)
+                }
+            }
         }
     }
 
@@ -928,12 +1257,12 @@ class NativeWebViewActivity : ComponentActivity() {
 
     private fun unregisterMobilePushWithMisskey(deviceId: String?) {
         if (deviceId.isNullOrBlank()) return
-        val origin = Uri.parse(intent.getStringExtra(EXTRA_URL) ?: DEFAULT_URL).let {
+        val origin = Uri.parse(intent.getStringExtra(EXTRA_URL) ?: defaultUrl).let {
             "${it.scheme}://${it.host}${if (it.port > 0) ":${it.port}" else ""}"
         }
         readMisskeyToken { token ->
             if (token.isNullOrBlank()) return@readMisskeyToken
-            Thread {
+            ioExecutor.execute {
                 callMisskeyPushApi(
                     "$origin/api/mobile-push/unregister",
                     token,
@@ -942,7 +1271,7 @@ class NativeWebViewActivity : ComponentActivity() {
                         put("deviceId", deviceId)
                     },
                 )
-            }.start()
+            }
         }
     }
 
@@ -971,7 +1300,7 @@ class NativeWebViewActivity : ComponentActivity() {
                 cb(null)
                 return@readMisskeyToken
             }
-            Thread {
+            ioExecutor.execute {
                 val result = callMisskeyPushApi(
                     "$origin/api/i",
                     token,
@@ -980,19 +1309,23 @@ class NativeWebViewActivity : ComponentActivity() {
                     },
                 )
                 if (!result.ok) {
-                    mainHandler.post { cb(null) }
-                    return@Thread
+                    mainHandler.post {
+                        if (!isFinishing && !isDestroyed) cb(null)
+                    }
+                    return@execute
                 }
                 val enabled = runCatching {
                     JSONObject(result.body).optBoolean("enableAppPush", false)
                 }.getOrNull()
-                mainHandler.post { cb(enabled) }
-            }.start()
+                mainHandler.post {
+                    if (!isFinishing && !isDestroyed) cb(enabled)
+                }
+            }
         }
     }
 
     private fun getMisskeyOrigin(): String {
-        return Uri.parse(intent.getStringExtra(EXTRA_URL) ?: DEFAULT_URL).let {
+        return Uri.parse(intent.getStringExtra(EXTRA_URL) ?: defaultUrl).let {
             "${it.scheme}://${it.host}${if (it.port > 0) ":${it.port}" else ""}"
         }
     }
@@ -1026,6 +1359,7 @@ class NativeWebViewActivity : ComponentActivity() {
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt().coerceAtLeast(1)
 
     override fun onPause() {
+        mainHandler.removeCallbacks(refreshChromeColorRunnable)
         webView.onPause()
         super.onPause()
     }
@@ -1034,11 +1368,9 @@ class NativeWebViewActivity : ComponentActivity() {
         super.onResume()
         applyPersistentSystemBars()
         webView.onResume()
-        // 先用缓存色立即压回去（防止短暂白栏），再异步从网页取色纠正。
+        // 先用缓存色立即压回去，再合并恢复/焦点事件后统一从网页校正。
         applySystemBarColor(lastChromeColor)
-        updateChromeColorFromWebPage()
-        mainHandler.postDelayed({ updateChromeColorFromWebPage() }, 120)
-        mainHandler.postDelayed({ updateChromeColorFromWebPage() }, 420)
+        scheduleChromeColorRefresh(180)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -1046,12 +1378,18 @@ class NativeWebViewActivity : ComponentActivity() {
         if (hasFocus) {
             applyPersistentSystemBars()
             applySystemBarColor(lastChromeColor)
-            updateChromeColorFromWebPage()
-            mainHandler.postDelayed({ updateChromeColorFromWebPage() }, 160)
+            scheduleChromeColorRefresh(180)
         }
     }
 
+    private fun scheduleChromeColorRefresh(delayMs: Long) {
+        mainHandler.removeCallbacks(refreshChromeColorRunnable)
+        mainHandler.postDelayed(refreshChromeColorRunnable, delayMs)
+    }
+
     override fun onDestroy() {
+        mainHandler.removeCallbacks(refreshChromeColorRunnable)
+        mainHandler.removeCallbacks(applyPendingChromeColorRunnable)
         filePathCallback?.onReceiveValue(null)
         filePathCallback = null
         webView.removeJavascriptInterface("AppNativePush")
@@ -1059,6 +1397,7 @@ class NativeWebViewActivity : ComponentActivity() {
         webView.webChromeClient = WebChromeClient()
         webView.webViewClient = WebViewClient()
         webView.destroy()
+        ioExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -1066,9 +1405,8 @@ class NativeWebViewActivity : ComponentActivity() {
     companion object {
         const val EXTRA_URL = "extra_url"
         const val EXTRA_UA_MARKER = "extra_ua_marker"
-        private const val DEFAULT_URL = "https://misskey.liminalselves.top/"
         private const val PREF_NATIVE_PUSH_ENABLED = "flutter.native_push_enabled"
-        /** 与 DEFAULT_URL 主机不同时，用于校验阿里云 extraMap.openUrl 是否可信 */
+        /** 与默认主机不同时，用于校验阿里云 extraMap.openUrl 是否可信 */
         private const val PREF_LAST_MISSKEY_ORIGIN = "liminal_last_misskey_origin"
         private const val EVENT_NATIVE_PUSH = "liminal-native-push"
         private const val EVENT_NATIVE_PUSH_ALERT = "liminal-native-push-alert"

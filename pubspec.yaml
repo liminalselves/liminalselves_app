@@ -1,5 +1,5 @@
 name: app
-description: "阈界人格（Liminal Selves）— Misskey 客户端壳工程，后续接 WebView 与阿里云 EMAS 推送。"
+description: "阈界人格（Liminal Selves）— 集成原生 WebView 与阿里云 EMAS 推送的 Misskey 客户端。"
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -17,7 +17,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
 # 对外版本名 + Android versionCode（每上架/发版递增 + 号后数字）
-version: 0.1.4+6
+version: 0.1.5+7
 
 environment:
   sdk: ^3.11.0
@@ -47,7 +47,6 @@ dependencies:
   webview_flutter_wkwebview: ^3.24.2
   file_picker: ^11.0.2
   image_picker: ^1.2.1
-  flutter_displaymode: ^0.7.0
 
 dev_dependencies:
   flutter_test:
@@ -115,10 +114,10 @@ flutter_launcher_icons:
 # 原生启动屏（首帧前）：执行 `dart run flutter_native_splash:create`
 flutter_native_splash:
   color: "#FFFFFF"
-  image: branding/logo.jpg
+  image: branding/splash_logo.png
   android_gravity: center
   ios_content_mode: center
   web: false
   android_12:
     color: "#FFFFFF"
-    image: branding/logo.jpg
+    image: branding/android12_splash_logo.png

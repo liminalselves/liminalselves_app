@@ -1,4 +1,5 @@
 import java.util.Properties
+import java.util.Base64
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
@@ -14,6 +15,25 @@ val keystorePropertiesFile = rootProject.file("key.properties")
 if (keystorePropertiesFile.exists()) {
     keystorePropertiesFile.inputStream().use { keystoreProperties.load(it) }
 }
+
+val dartDefines = (project.findProperty("dart-defines") as? String)
+    .orEmpty()
+    .split(',')
+    .mapNotNull { encoded ->
+        runCatching {
+            String(Base64.getDecoder().decode(encoded), Charsets.UTF_8)
+        }.getOrNull()
+    }
+    .associate { define ->
+        val separator = define.indexOf('=')
+        if (separator < 0) define to "" else define.substring(0, separator) to define.substring(separator + 1)
+    }
+val misskeyUrl = dartDefines["MISSKEY_URL"]
+    ?.takeIf { it.isNotBlank() }
+    ?: "https://misskey.liminalselves.top/"
+val escapedMisskeyUrl = misskeyUrl
+    .replace("\\", "\\\\")
+    .replace("\"", "\\\"")
 
 android {
     namespace = "top.liminalselves.app"
@@ -39,6 +59,16 @@ android {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
         multiDexEnabled = true
+        buildConfigField("String", "MISSKEY_URL", "\"$escapedMisskeyUrl\"")
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    lint {
+        // Flutter tool rewrites local.properties with Windows paths before each build.
+        disable += "PropertyEscape"
     }
 
     packaging {
@@ -66,8 +96,12 @@ android {
             } else {
                 signingConfigs.getByName("debug")
             }
-            isMinifyEnabled = false
-            isShrinkResources = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
         }
     }
 }

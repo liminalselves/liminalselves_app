@@ -2,6 +2,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- WebView 文件选择与 `<input capture>` 拍照 -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
     <!-- Android 13+ 通知权限（阿里云推送 SDK 3.8.4+ 会处理，此处显式声明） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
@@ -78,6 +81,16 @@
 
          In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
     <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <category android:name="android.intent.category.BROWSABLE"/>
+            <data android:scheme="http"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <category android:name="android.intent.category.BROWSABLE"/>
+            <data android:scheme="https"/>
+        </intent>
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>

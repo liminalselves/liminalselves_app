@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 /// 控制 Android 前台服务以保持 App 在后台存活
@@ -10,7 +11,7 @@ class KeepAliveService {
       final result = await _channel.invokeMethod<bool>('start');
       return result ?? false;
     } catch (e) {
-      print('[KeepAlive] start failed: $e');
+      debugPrint('[KeepAlive] start failed: $e');
       return false;
     }
   }
@@ -21,7 +22,7 @@ class KeepAliveService {
       final result = await _channel.invokeMethod<bool>('stop');
       return result ?? false;
     } catch (e) {
-      print('[KeepAlive] stop failed: $e');
+      debugPrint('[KeepAlive] stop failed: $e');
       return false;
     }
   }

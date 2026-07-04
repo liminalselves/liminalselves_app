@@ -1,12 +1,17 @@
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart' show TargetPlatform, defaultTargetPlatform;
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:version/version.dart';
+
+const MethodChannel _externalUrlChannel = MethodChannel(
+  'top.liminalselves.app/native_webview',
+);
 
 class OptionalShellUpdateHint {
   const OptionalShellUpdateHint({
@@ -23,10 +28,7 @@ class OptionalShellUpdateHint {
 }
 
 class AppUpdateEntry {
-  const AppUpdateEntry({
-    required this.version,
-    required this.content,
-  });
+  const AppUpdateEntry({required this.version, required this.content});
 
   final String version;
   final String content;
@@ -123,6 +125,40 @@ List<AppUpdateEntry> _pickUpdateEntriesInRange({
   return out;
 }
 
+Future<bool> _openExternalUrl(String rawUrl) async {
+  final url = rawUrl.trim();
+  final uri = Uri.tryParse(url);
+  if (uri == null || uri.scheme.isEmpty || uri.host.isEmpty) return false;
+
+  if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+    try {
+      final opened = await _externalUrlChannel.invokeMethod<bool>(
+        'openExternalUrl',
+        {'url': uri.toString()},
+      );
+      if (opened == true) return true;
+    } on PlatformException {
+      // Fall back to url_launcher below.
+    }
+  }
+
+  try {
+    return await launchUrl(uri, mode: LaunchMode.externalApplication);
+  } catch (_) {
+    return false;
+  }
+}
+
+Future<bool> _openUpdateUrl(BuildContext context, String rawUrl) async {
+  final opened = await _openExternalUrl(rawUrl);
+  if (!opened && context.mounted) {
+    ScaffoldMessenger.maybeOf(
+      context,
+    )?.showSnackBar(const SnackBar(content: Text('无法在浏览器中打开更新链接')));
+  }
+  return opened;
+}
+
 /// POST `/api/meta`，与 Misskey 前端一致；失败时返回 null（不阻断壳，避免离线不可用）。
 Uri _metaApiUri(String misskeyBaseUrl) {
   final b = Uri.parse(misskeyBaseUrl);
@@ -130,7 +166,9 @@ Uri _metaApiUri(String misskeyBaseUrl) {
   return b.replace(pathSegments: [...segs, 'api', 'meta']);
 }
 
-Future<Map<String, dynamic>?> fetchMisskeyMetaLite(String misskeyBaseUrl) async {
+Future<Map<String, dynamic>?> fetchMisskeyMetaLite(
+  String misskeyBaseUrl,
+) async {
   final uri = _metaApiUri(misskeyBaseUrl);
   try {
     final res = await http
@@ -158,7 +196,10 @@ Future<ShellStartupOutcome> evaluateShellVersionPolicy({
 }) async {
   final meta = await fetchMisskeyMetaLite(misskeyBaseUrl);
   if (meta == null) {
-    return const ShellStartupOutcome(forceBlocked: false, metaFetchFailed: true);
+    return const ShellStartupOutcome(
+      forceBlocked: false,
+      metaFetchFailed: true,
+    );
   }
 
   final accent = _parseThemeColorHex(meta['themeColor'] as String?);
@@ -197,9 +238,11 @@ Future<ShellStartupOutcome> evaluateShellVersionPolicy({
   }
 
   OptionalShellUpdateHint? optional;
-  final latestRaw = (defaultTargetPlatform == TargetPlatform.iOS
-          ? n['latestIosVersion']
-          : n['latestAndroidVersion']) as String?;
+  final latestRaw =
+      (defaultTargetPlatform == TargetPlatform.iOS
+              ? n['latestIosVersion']
+              : n['latestAndroidVersion'])
+          as String?;
   final latestTrim = latestRaw?.trim() ?? '';
   if (latestTrim.isNotEmpty) {
     final latestV = _tryParseVersion(latestTrim);
@@ -253,7 +296,9 @@ class ForceShellUpdatePage extends StatelessWidget {
                   elevation: 0,
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(16),
-                    side: BorderSide(color: scheme.outlineVariant.withValues(alpha: 0.5)),
+                    side: BorderSide(
+                      color: scheme.outlineVariant.withValues(alpha: 0.5),
+                    ),
                   ),
                   child: Padding(
                     padding: const EdgeInsets.fromLTRB(24, 28, 24, 24),
@@ -277,15 +322,15 @@ class ForceShellUpdatePage extends StatelessWidget {
                         Text(
                           '需要更新应用',
                           textAlign: TextAlign.center,
-                          style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                                fontWeight: FontWeight.w700,
-                              ),
+                          style: Theme.of(context).textTheme.titleLarge
+                              ?.copyWith(fontWeight: FontWeight.w700),
                         ),
                         const SizedBox(height: 12),
                         Text(
                           '当前版本过低，无法继续使用。请更新到服务器要求的最低版本后再打开。',
                           textAlign: TextAlign.center,
-                          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(
                                 color: scheme.onSurfaceVariant,
                                 height: 1.45,
                               ),
@@ -293,23 +338,24 @@ class ForceShellUpdatePage extends StatelessWidget {
                         const SizedBox(height: 20),
                         _monoKeyValueRow(context, '当前版本', info.currentVersion),
                         const SizedBox(height: 8),
-                        _monoKeyValueRow(context, '最低要求', info.minRequiredVersion),
+                        _monoKeyValueRow(
+                          context,
+                          '最低要求',
+                          info.minRequiredVersion,
+                        ),
                         const SizedBox(height: 24),
                         SizedBox(
                           width: double.infinity,
                           child: FilledButton(
-                            onPressed: (info.downloadUrl == null ||
+                            onPressed:
+                                (info.downloadUrl == null ||
                                     info.downloadUrl!.isEmpty)
                                 ? null
                                 : () async {
-                                    final uri = Uri.tryParse(info.downloadUrl!);
-                                    if (uri != null &&
-                                        await canLaunchUrl(uri)) {
-                                      await launchUrl(
-                                        uri,
-                                        mode: LaunchMode.externalApplication,
-                                      );
-                                    }
+                                    await _openUpdateUrl(
+                                      context,
+                                      info.downloadUrl!,
+                                    );
                                   },
                             child: const Text('获取更新'),
                           ),
@@ -333,7 +379,6 @@ class ForceShellUpdatePage extends StatelessWidget {
       ),
     );
   }
-
 }
 
 Widget _monoKeyValueRow(BuildContext context, String label, String value) {
@@ -345,31 +390,31 @@ Widget _monoKeyValueRow(BuildContext context, String label, String value) {
         width: 72,
         child: Text(
           label,
-          style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: scheme.onSurfaceVariant,
-              ),
+          style: Theme.of(
+            context,
+          ).textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
         ),
       ),
       Expanded(
         child: SelectableText(
           value,
           style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                fontFamily: 'monospace',
-                fontFamilyFallback: const ['monospace'],
-              ),
+            fontFamily: 'monospace',
+            fontFamilyFallback: const ['monospace'],
+          ),
         ),
       ),
     ],
   );
 }
 
-Future<void> showOptionalShellUpdateDialog(
+Future<bool> showOptionalShellUpdateDialog(
   BuildContext context,
   OptionalShellUpdateHint hint,
 ) async {
   final scheme = Theme.of(context).colorScheme;
-  if (!context.mounted) return;
-  await showDialog<void>(
+  if (!context.mounted) return false;
+  final openedUpdate = await showDialog<bool>(
     context: context,
     barrierDismissible: true,
     builder: (ctx) => AlertDialog(
@@ -381,7 +426,10 @@ Future<void> showOptionalShellUpdateDialog(
           color: scheme.primaryContainer,
           shape: BoxShape.circle,
         ),
-        child: Icon(Icons.new_releases_outlined, color: scheme.onPrimaryContainer),
+        child: Icon(
+          Icons.new_releases_outlined,
+          color: scheme.onPrimaryContainer,
+        ),
       ),
       title: const Text('发现新版本'),
       content: SingleChildScrollView(
@@ -394,23 +442,37 @@ Future<void> showOptionalShellUpdateDialog(
               style: TextStyle(color: scheme.onSurfaceVariant, height: 1.45),
             ),
             const SizedBox(height: 16),
-            Text('最新：${hint.latestVersion}', style: const TextStyle(fontWeight: FontWeight.w600)),
-            Text('当前：${hint.localVersion}', style: TextStyle(color: scheme.onSurfaceVariant)),
+            Text(
+              '最新：${hint.latestVersion}',
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+            Text(
+              '当前：${hint.localVersion}',
+              style: TextStyle(color: scheme.onSurfaceVariant),
+            ),
             if (hint.updateEntries.isNotEmpty) ...[
               const SizedBox(height: 12),
-              const Text('更新内容：', style: TextStyle(fontWeight: FontWeight.w700)),
+              const Text(
+                '更新内容：',
+                style: TextStyle(fontWeight: FontWeight.w700),
+              ),
               const SizedBox(height: 8),
-              ...hint.updateEntries.map((item) => Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(item.version, style: const TextStyle(fontWeight: FontWeight.w600)),
-                        if (item.content.trim().isNotEmpty)
-                          SelectableText(item.content),
-                      ],
-                    ),
-                  )),
+              ...hint.updateEntries.map(
+                (item) => Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        item.version,
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      if (item.content.trim().isNotEmpty)
+                        SelectableText(item.content),
+                    ],
+                  ),
+                ),
+              ),
             ] else ...[
               const SizedBox(height: 8),
               Text(
@@ -430,10 +492,12 @@ Future<void> showOptionalShellUpdateDialog(
           onPressed: (hint.downloadUrl == null || hint.downloadUrl!.isEmpty)
               ? null
               : () async {
-                  Navigator.of(ctx).pop();
-                  final uri = Uri.tryParse(hint.downloadUrl!);
-                  if (uri != null && await canLaunchUrl(uri)) {
-                    await launchUrl(uri, mode: LaunchMode.externalApplication);
+                  final opened = await _openUpdateUrl(
+                    context,
+                    hint.downloadUrl!,
+                  );
+                  if (opened && ctx.mounted) {
+                    Navigator.of(ctx).pop(true);
                   }
                 },
           child: const Text('前往更新'),
@@ -441,4 +505,5 @@ Future<void> showOptionalShellUpdateDialog(
       ],
     ),
   );
+  return openedUpdate == true;
 }

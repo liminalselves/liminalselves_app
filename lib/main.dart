@@ -15,7 +15,6 @@ import 'webview_web_register_stub.dart'
     if (dart.library.html) 'webview_web_register_web.dart';
 
 import 'android_native_webview_launcher.dart';
-import 'android_display_refresh.dart';
 import 'embedded_webview_perf.dart';
 import 'keep_alive_service.dart';
 import 'mobile_push.dart';
@@ -111,31 +110,13 @@ class LiminalRootApp extends StatefulWidget {
   State<LiminalRootApp> createState() => _LiminalRootAppState();
 }
 
-class _LiminalRootAppState extends State<LiminalRootApp>
-    with WidgetsBindingObserver {
+class _LiminalRootAppState extends State<LiminalRootApp> {
   ShellStartupOutcome? _outcome;
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    scheduleAndroidDisplayModeAfterUiReady();
     unawaited(_bootstrap());
-  }
-
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    super.dispose();
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (!kIsWeb &&
-        defaultTargetPlatform == TargetPlatform.android &&
-        state == AppLifecycleState.resumed) {
-      unawaited(applyAndroidBestDisplayMode());
-    }
   }
 
   Future<void> _bootstrap() async {
@@ -258,7 +239,8 @@ class _MisskeyWebShellState extends State<MisskeyWebShell>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
     if (!_useEmbeddedWebView || kIsWeb) return;
-    if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
       _lastPausedAt = DateTime.now();
       // 进入后台时启动前台服务，保持 WebSocket 连接
       unawaited(KeepAliveService.start());
@@ -367,7 +349,8 @@ class _MisskeyWebShellState extends State<MisskeyWebShell>
     if (!mounted) return;
     final h = widget.optionalShellUpdateHint;
     if (h != null) {
-      await showOptionalShellUpdateDialog(context, h);
+      final openedUpdate = await showOptionalShellUpdateDialog(context, h);
+      if (openedUpdate) return;
     }
     if (!mounted) return;
     await _openAndroidNativeShell();
@@ -488,7 +471,8 @@ class _MisskeyWebShellState extends State<MisskeyWebShell>
     final enabledInSystem = await isAndroidSystemNotificationsEnabled();
     await _dispatchNativePushStateToWeb(
       c,
-      registered: (prefs.getBool(kPrefNativePushEnabled) ?? false) && enabledInSystem,
+      registered:
+          (prefs.getBool(kPrefNativePushEnabled) ?? false) && enabledInSystem,
     );
   }
 
@@ -527,7 +511,9 @@ class _MisskeyWebShellState extends State<MisskeyWebShell>
           await _dispatchNativePushStateToWeb(
             c,
             registered: false,
-            errorCode: enabledInSystem ? 'push_setup_failed' : 'permission_denied',
+            errorCode: enabledInSystem
+                ? 'push_setup_failed'
+                : 'permission_denied',
           );
         }
       case 'disable':
@@ -546,7 +532,9 @@ class _MisskeyWebShellState extends State<MisskeyWebShell>
       final granted = await isAndroidNotificationPermissionGranted();
       final enabledInSystem = await isAndroidSystemNotificationsEnabled();
       if (!granted || !enabledInSystem) {
-        debugPrint('[AppNativePush] notification permission/system switch not ready');
+        debugPrint(
+          '[AppNativePush] notification permission/system switch not ready',
+        );
         return false;
       }
     }
@@ -662,7 +650,9 @@ class _MisskeyWebShellState extends State<MisskeyWebShell>
     if (await isAndroidSystemNotificationsEnabled()) return;
 
     final afterRequest = await Permission.notification.request();
-    if (afterRequest.isGranted && await isAndroidSystemNotificationsEnabled()) return;
+    if (afterRequest.isGranted && await isAndroidSystemNotificationsEnabled()) {
+      return;
+    }
 
     debugPrint(
       '[AppNativePush] startup: notification permission missing/denied; '
@@ -921,8 +911,7 @@ class _MisskeyWebShellState extends State<MisskeyWebShell>
         }
         final now = DateTime.now();
         final prev = _lastExitBackPressAt;
-        if (prev != null &&
-            now.difference(prev) <= _kExitConfirmWindow) {
+        if (prev != null && now.difference(prev) <= _kExitConfirmWindow) {
           SystemNavigator.pop();
           return;
         }

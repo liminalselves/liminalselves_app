@@ -1,6 +1,13 @@
 # 阈界人格（Liminal Selves）
 
-Flutter 工程，包名与 iOS Bundle ID 均为 **`top.liminalselves.app`**，与阿里云 EMAS 控制台填写一致。
+Misskey 移动客户端工程，包名与 iOS Bundle ID 均为 **`top.liminalselves.app`**，与阿里云 EMAS 控制台填写一致。
+
+## 当前架构
+
+- **Android：** 轻量原生启动门控负责版本检查，随后进入全屏 `NativeWebViewActivity`；集成文件选择、外链确认、错误恢复、系统栏同步和阿里云 EMAS 推送。
+- **iOS / macOS：** 使用 Flutter `webview_flutter` 内嵌页面。
+- **Windows / Web：** 保留 Flutter 调试与不支持内嵌时的浏览器回退页面。
+- **实例地址：** 通过 `--dart-define=MISSKEY_URL=...` 注入，Android 会同步写入 `BuildConfig.MISSKEY_URL`。
 
 ## 与 Misskey 仓库的关系
 
@@ -13,18 +20,31 @@ Flutter 工程，包名与 iOS Bundle ID 均为 **`top.liminalselves.app`**，�
 
 ## 本地运行
 
-```bash
+```powershell
 cd liminalselves
 flutter pub get
-flutter run
+flutter run --dart-define=MISSKEY_URL=http://47.79.85.42:8888/
 ```
 
-## 下一步（按顺序）
+## Android 正式打包
 
-1. **初始化 Git 远程**：在代码托管平台建空仓库，`git remote add origin ...` 后首次推送。
-2. **接入阿里云 EMAS SDK**：按官方文档把 Android（Gradle / AAR）与 iOS（Pod 或 Framework）接到 `android/`、`ios/`；Flutter 侧用 **MethodChannel** 把设备标识暴露给 Dart，并调用 Misskey 的 **`/api/mobile-push/register`** 完成绑定。
-3. **WebView**：首屏加载你的 Misskey 站点 URL；深链与通知点击后再导航到目标路径。
-4. **Misskey 实例管理员**：在 **控制面板 → 设置** 中填写阿里云 **AccessKey** 与 **EMAS AppKey**（须与本工程 `aliyun-emas-services.json` 中 AppKey 一致）。详见 `misskey/docs/aliyun-mobile-push.md`。
+```powershell
+flutter build apk --release --dart-define=MISSKEY_URL=http://47.79.85.42:8888/
+```
+
+产物位于 `build/app/outputs/flutter-apk/app-release.apk`。当前发布流程只生成 APK，不生成 AAB。
+
+发布前执行：
+
+```powershell
+flutter analyze
+flutter test
+.\android\gradlew.bat -p android lintRelease
+```
+
+## 服务端配置
+
+Misskey 实例管理员需在 **控制面板 → 设置** 中填写阿里云 **AccessKey** 与 **EMAS AppKey**，并确保 AppKey 与客户端配置一致。服务端说明见 `misskey/docs/aliyun-mobile-push.md`。
 
 ## 已下载的 SDK 压缩包
 
