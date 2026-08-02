@@ -2,6 +2,10 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- WebView 文件选择与 `<input capture>` 拍照 -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Android 9 及以下下载文件需要写外部存储；API 29+ 使用 MediaStore/应用私有目录无需此权限 -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
     <uses-feature
         android:name="android.hardware.camera"
         android:required="false" />

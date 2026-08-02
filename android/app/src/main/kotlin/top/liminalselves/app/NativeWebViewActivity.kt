@@ -2,13 +2,16 @@ package top.liminalselves.app
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.DownloadManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.res.ColorStateList
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
@@ -28,7 +31,9 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.JavascriptInterface
+import android.webkit.MimeTypeMap
 import android.webkit.PermissionRequest
+import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -59,6 +64,7 @@ import android.view.ContextThemeWrapper
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
@@ -151,6 +157,48 @@ class NativeWebViewActivity : ComponentActivity() {
             pendingNotificationPermissionFromStartup = false
         }
 
+    // ─── 文件下载 ───────────────────────────────────────────────────────────
+    private data class PendingDownload(
+        val url: String,
+        val fileName: String,
+        val mimeType: String,
+        val userAgent: String?,
+    )
+    private var pendingDownload: PendingDownload? = null
+
+    private val storagePermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            val dl = pendingDownload
+            pendingDownload = null
+            if (dl == null) return@registerForActivityResult
+            if (granted) {
+                startDownloadWithManager(dl.url, dl.fileName, dl.mimeType, dl.userAgent)
+            } else {
+                Toast.makeText(this, "存储权限被拒绝，无法保存文件", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+    private val downloadCompleteReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != DownloadManager.ACTION_DOWNLOAD_COMPLETE) return
+            val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+            if (id < 0) return
+            val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            val uri = dm.getUriForDownloadedFile(id) ?: return
+            Toast.makeText(this@NativeWebViewActivity, "下载完成", Toast.LENGTH_SHORT).show()
+            // 尝试打开文件
+            runCatching {
+                val openIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, dm.getMimeTypeForDownloadedFile(id) ?: "*/*")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                startActivity(openIntent)
+            }.onFailure {
+                Log.w(TAG, "Cannot open downloaded file: ${it.message}")
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         overridePendingTransition(0, 0)
@@ -159,13 +207,25 @@ class NativeWebViewActivity : ComponentActivity() {
         applyPersistentSystemBars()
         setupViews()
         setupWebView()
+        registerReceiver(
+            downloadCompleteReceiver,
+            IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+            Context.RECEIVER_NOT_EXPORTED,
+        )
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (webView.canGoBack()) {
+                // 实时从 WebView 引擎获取当前 URL，避免 SPA pushState 后 currentUrl 滞后
+                val actualUrl = webView.url ?: currentUrl
+                val path = Uri.parse(actualUrl).path.orEmpty()
+                val atSectionRoot = isSectionRootPath(path)
+
+                // 非板块根且有历史 → 正常回退
+                if (!atSectionRoot && webView.canGoBack()) {
                     lastExitBackPressElapsed = 0L
                     webView.goBack()
                     return
                 }
+                // 板块根或无历史：双击退出
                 val now = SystemClock.elapsedRealtime()
                 if (lastExitBackPressElapsed != 0L &&
                     now - lastExitBackPressElapsed <= EXIT_CONFIRM_MS
@@ -297,6 +357,8 @@ class NativeWebViewActivity : ComponentActivity() {
         }
         webView.addJavascriptInterface(AppNativePushBridge(), "AppNativePush")
         webView.addJavascriptInterface(AppChromeBridge(), "AppChrome")
+        webView.addJavascriptInterface(AppNavBridge(), "AppNav")
+        webView.addJavascriptInterface(AppDownloadBridge(), "AppDownload")
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
                 view: WebView?,
@@ -321,6 +383,7 @@ class NativeWebViewActivity : ComponentActivity() {
                 installChromeColorSyncBridge()
                 updateChromeColorFromWebPage()
                 injectLiminalAppInfo()
+                installSpaNavWatcher()
                 reconcileStartupNotificationPermission()
                 injectNativePushStateFromPrefs()
                 onPageReadyForPushRestore()
@@ -399,6 +462,9 @@ class NativeWebViewActivity : ComponentActivity() {
                 return true
             }
         }
+        webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
+            handleWebViewDownload(url, userAgent, contentDisposition, mimetype)
+        }
     }
 
     private fun setupViews() {
@@ -418,7 +484,14 @@ class NativeWebViewActivity : ComponentActivity() {
             // 只下移刷新指示器位置，保持当前触发/回弹手感不变。
             setProgressViewOffset(false, dp(18), dp(62))
             setOnRefreshListener {
-                retryFromErrorPage()
+                if (showingErrorPage) {
+                    retryFromErrorPage()
+                } else {
+                    // 使用 webView.reload() 而非 loadUrl(currentUrl)：
+                    // SPA pushState 路由不触发 onPageStarted，currentUrl 可能滞后；
+                    // reload() 始终重新加载 WebView 引擎实际跟踪的当前 URL。
+                    webView.reload()
+                }
             }
         }
         // 透明状态栏下，把安全区显式变成顶部 padding，避免刘海/状态栏遮挡内容。
@@ -639,15 +712,26 @@ class NativeWebViewActivity : ComponentActivity() {
     }
 
     /**
-     * 仅在“手势起点位于顶部热区”且“WebView 已在顶端”时允许触发刷新。
+     * 仅在"手势起点位于顶部热区"且"WebView 已在顶端"时允许触发刷新。
      * 在父容器 onIntercept 阶段判断，规避 dispatchTouchEvent 与 SwipeRefreshLayout 的时序竞争。
+     *
+     * 方向锁定机制：手势超过 touch slop 后根据轨迹角度判断水平/垂直意图，
+     * 水平意图为主时永久拒绝拦截，避免与页面内横向导航栏滑动冲突。
      */
     private class TopEdgeSwipeRefreshLayout(context: Context) : SwipeRefreshLayout(context) {
         var hotZonePx: Int = 0
         var statusBarInsetProvider: (() -> Int)? = null
         var canChildScrollUpProvider: (() -> Boolean)? = null
+    
         private var gestureEligible = false
-
+        private var downX = 0f
+        private var downY = 0f
+        private val touchSlop = android.view.ViewConfiguration.get(context).scaledTouchSlop
+        /** 热区内使用更大的触发阈值（1.8 倍 touch slop），容忍水平滑动时的垂直抖动。 */
+        private val verticalTriggerSlop = (touchSlop * 1.8f).toInt()
+        /** 方向锁定状态：0=未确定, 1=垂直(允许刷新), -1=水平(拒绝刷新) */
+        private var directionLock = 0
+    
         override fun onInterceptTouchEvent(ev: android.view.MotionEvent): Boolean {
             when (ev.actionMasked) {
                 android.view.MotionEvent.ACTION_DOWN -> {
@@ -655,21 +739,52 @@ class NativeWebViewActivity : ComponentActivity() {
                     val inHotZone = ev.y <= (statusTop + hotZonePx)
                     val canScrollUp = canChildScrollUpProvider?.invoke() ?: true
                     gestureEligible = inHotZone && !canScrollUp
+                    downX = ev.x
+                    downY = ev.y
+                    directionLock = 0
+                }
+                android.view.MotionEvent.ACTION_MOVE -> {
+                    if (gestureEligible && directionLock == 0) {
+                        val dx = Math.abs(ev.x - downX)
+                        val dy = Math.abs(ev.y - downY)
+                        if (dx > touchSlop || dy > verticalTriggerSlop) {
+                            directionLock = if (dx > dy) {
+                                // 水平意图为主 → 拒绝拦截，让 WebView 处理横向滚动
+                                -1
+                            } else if (dy > dx * 0.577f) {
+                                // 垂直分量占优（角度 > 30° 偏离水平）→ 允许刷新
+                                1
+                            } else {
+                                -1
+                            }
+                            if (directionLock == -1) {
+                                gestureEligible = false
+                            }
+                        } else {
+                            // 尚未超过阈值，不拦截，继续观察
+                            return false
+                        }
+                    }
                 }
                 android.view.MotionEvent.ACTION_UP,
                 android.view.MotionEvent.ACTION_CANCEL -> {
                     gestureEligible = false
+                    directionLock = 0
                 }
             }
-            return gestureEligible && super.onInterceptTouchEvent(ev)
+            if (!gestureEligible) return false
+            // 方向已锁定为水平时不拦截
+            if (directionLock == -1) return false
+            return super.onInterceptTouchEvent(ev)
         }
-
+    
         override fun onTouchEvent(ev: android.view.MotionEvent): Boolean {
             if (!gestureEligible && !isRefreshing) return false
             if (ev.actionMasked == android.view.MotionEvent.ACTION_UP ||
                 ev.actionMasked == android.view.MotionEvent.ACTION_CANCEL
             ) {
                 gestureEligible = false
+                directionLock = 0
             }
             return super.onTouchEvent(ev)
         }
@@ -948,6 +1063,201 @@ class NativeWebViewActivity : ComponentActivity() {
         }.getOrNull()
     }
 
+    // ─── 文件下载实现 ─────────────────────────────────────────────────────────
+
+    private fun handleWebViewDownload(
+        url: String,
+        userAgent: String?,
+        contentDisposition: String?,
+        mimetype: String?,
+    ) {
+        val fileName = parseDownloadFileName(url, contentDisposition, mimetype)
+        val mime = mimetype?.takeIf { it.isNotBlank() }
+            ?: guessMimeType(fileName, url)
+
+        when {
+            url.startsWith("blob:") -> downloadBlobViaJs(url, fileName, mime)
+            url.startsWith("data:") -> saveDataUrl(url, fileName, mime)
+            else -> {
+                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+                    if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                        != PackageManager.PERMISSION_GRANTED
+                    ) {
+                        pendingDownload = PendingDownload(url, fileName, mime, userAgent)
+                        storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                        return
+                    }
+                }
+                startDownloadWithManager(url, fileName, mime, userAgent)
+            }
+        }
+    }
+
+    /** 使用系统 DownloadManager 执行下载（通知栏进度、断点续传）。 */
+    private fun startDownloadWithManager(
+        url: String,
+        fileName: String,
+        mimeType: String,
+        userAgent: String?,
+    ) {
+        runCatching {
+            val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            val request = DownloadManager.Request(Uri.parse(url)).apply {
+                setMimeType(mimeType)
+                userAgent?.let { addRequestHeader("User-Agent", it) }
+                setTitle(fileName)
+                setDescription("正在下载…")
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                // 保存到公共 Download 目录（/storage/emulated/0/Download/），
+                // DownloadManager 有特权写入公共目录，无需额外权限；文件名冲突由 DM 自动追加后缀。
+                setDestinationInExternalPublicDir(
+                    Environment.DIRECTORY_DOWNLOADS,
+                    fileName,
+                )
+                setAllowedOverMetered(true)
+                setAllowedOverRoaming(false)
+            }
+            dm.enqueue(request)
+            Toast.makeText(this, "开始下载: $fileName", Toast.LENGTH_SHORT).show()
+        }.onFailure {
+            Log.w(TAG, "DownloadManager enqueue failed: ${it.message}")
+            Toast.makeText(this, "下载失败: ${it.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * blob: URL 无法被 DownloadManager 处理，通过 JS fetch 转为 base64 后回传原生层保存。
+     */
+    private fun downloadBlobViaJs(blobUrl: String, fileName: String, mimeType: String) {
+        val escapedUrl = blobUrl.replace("\\", "\\\\").replace("'", "\\'")
+        val js = """
+            (function() {
+              fetch('$escapedUrl')
+                .then(function(r) { return r.blob(); })
+                .then(function(blob) {
+                  var reader = new FileReader();
+                  reader.onloadend = function() {
+                    var base64 = reader.result.split(',')[1] || '';
+                    window.AppDownload && window.AppDownload.onBlobReady(base64, '$fileName', '$mimeType');
+                  };
+                  reader.readAsDataURL(blob);
+                })
+                .catch(function(e) {
+                  window.AppDownload && window.AppDownload.onBlobError(e.message || 'fetch failed');
+                });
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    /** data: URL 直接解码保存。 */
+    private fun saveDataUrl(dataUrl: String, fileName: String, mimeType: String) {
+        ioExecutor.execute {
+            runCatching {
+                val base64Part = dataUrl.substringAfter(",")
+                val bytes = android.util.Base64.decode(base64Part, android.util.Base64.DEFAULT)
+                val file = File(
+                    getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
+                    uniqueFileName(fileName),
+                )
+                FileOutputStream(file).use { it.write(bytes) }
+                mainHandler.post {
+                    Toast.makeText(this, "已保存: ${file.name}", Toast.LENGTH_SHORT).show()
+                }
+            }.onFailure {
+                mainHandler.post {
+                    Toast.makeText(this, "保存失败: ${it.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    /** 从 Content-Disposition / URL 中解析文件名。 */
+    private fun parseDownloadFileName(
+        url: String,
+        contentDisposition: String?,
+        mimeType: String?,
+    ): String {
+        // 优先从 Content-Disposition 提取
+        contentDisposition?.let { cd ->
+            val filenameStar = Regex("filename\\*=(?:UTF-8''|utf-8'')(.+?)(?:;|$)", RegexOption.IGNORE_CASE)
+                .find(cd)?.groupValues?.get(1)?.trim()
+            if (filenameStar != null) {
+                return runCatching { java.net.URLDecoder.decode(filenameStar, "UTF-8") }.getOrDefault(filenameStar)
+            }
+            val filename = Regex("filename=\"?([^\";\n]+)\"?", RegexOption.IGNORE_CASE)
+                .find(cd)?.groupValues?.get(1)?.trim()
+            if (!filename.isNullOrBlank()) return filename
+        }
+        // 回退到 URLUtil
+        val guessed = URLUtil.guessFileName(url, contentDisposition, mimeType)
+        if (guessed.isNotBlank() && guessed != "downloadfile") return guessed
+        // 最后兜底
+        val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType ?: "application/octet-stream") ?: "bin"
+        return "download_${System.currentTimeMillis()}.$ext"
+    }
+
+    private fun guessMimeType(fileName: String, url: String): String {
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+            ?: if (url.startsWith("data:")) {
+                url.substringAfter("data:").substringBefore(";").substringBefore(",").ifBlank { "application/octet-stream" }
+            } else {
+                "application/octet-stream"
+            }
+    }
+
+    /** 文件名冲突时自动追加序号。 */
+    private fun uniqueFileName(name: String): String {
+        val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: return name
+        val base = name.substringBeforeLast('.', name)
+        val ext = name.substringAfterLast('.', "")
+        var candidate = name
+        var seq = 1
+        while (File(dir, candidate).exists()) {
+            candidate = if (ext.isNotBlank()) "${base}($seq).$ext" else "${base}($seq)"
+            seq++
+        }
+        return candidate
+    }
+
+    /** blob 下载桥：接收 JS 层回传的 base64 数据并保存为文件。 */
+    private inner class AppDownloadBridge {
+        @JavascriptInterface
+        fun onBlobReady(base64: String?, fileName: String?, mimeType: String?) {
+            val data = base64.orEmpty()
+            val name = fileName?.takeIf { it.isNotBlank() } ?: "download_${System.currentTimeMillis()}"
+            if (data.isEmpty()) {
+                runOnUiThread { Toast.makeText(this@NativeWebViewActivity, "下载失败: 空数据", Toast.LENGTH_SHORT).show() }
+                return
+            }
+            ioExecutor.execute {
+                runCatching {
+                    val bytes = android.util.Base64.decode(data, android.util.Base64.DEFAULT)
+                    val file = File(
+                        getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
+                        uniqueFileName(name),
+                    )
+                    FileOutputStream(file).use { it.write(bytes) }
+                    mainHandler.post {
+                        Toast.makeText(this@NativeWebViewActivity, "已保存: ${file.name}", Toast.LENGTH_SHORT).show()
+                    }
+                }.onFailure {
+                    mainHandler.post {
+                        Toast.makeText(this@NativeWebViewActivity, "保存失败: ${it.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun onBlobError(error: String?) {
+            runOnUiThread {
+                Toast.makeText(this@NativeWebViewActivity, "下载失败: ${error ?: "unknown"}", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
     private inner class AppNativePushBridge {
         @JavascriptInterface
         fun postMessage(msg: String?) {
@@ -984,6 +1294,67 @@ class NativeWebViewActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * SPA 路由变化桥：Misskey 使用 pushState 做客户端路由，
+     * 当用户前进到"板块根路径"时清空 WebView 历史栈，
+     * 使返回键表现为"回上级/退出"而非"倒带每一步"。
+     */
+    private inner class AppNavBridge {
+        @JavascriptInterface
+        fun onNavigateTo(path: String?) {
+            val p = path?.trim().orEmpty()
+            if (p.isEmpty()) return
+            runOnUiThread {
+                // 同步 currentUrl，避免下拉刷新/通知等场景使用滞后值
+                val base = currentUrl.let {
+                    val u = Uri.parse(it)
+                    val scheme = u.scheme ?: "https"
+                    val host = u.host ?: return@let it
+                    val port = u.port
+                    if (port == -1) "$scheme://$host" else "$scheme://$host:$port"
+                }
+                currentUrl = base + (if (p.startsWith("/")) p else "/$p")
+            }
+        }
+    }
+
+    /**
+     * 注入 SPA 路由监听：monkey-patch history.pushState，
+     * 仅在前进导航（pushState）时通知原生层，popstate（后退）不触发。
+     */
+    private fun installSpaNavWatcher() {
+        val js = """
+            (function() {
+              if (window.__LIMINAL_NAV_WATCHER_INSTALLED__) return;
+              window.__LIMINAL_NAV_WATCHER_INSTALLED__ = true;
+              var lastPath = location.pathname;
+              function notify(path) {
+                try {
+                  if (window.AppNav && window.AppNav.onNavigateTo) {
+                    window.AppNav.onNavigateTo(path || '');
+                  }
+                } catch (_) {}
+              }
+              var origPush = history.pushState.bind(history);
+              history.pushState = function(state, title, url) {
+                origPush(state, title, url);
+                var newPath = location.pathname;
+                if (newPath !== lastPath) {
+                  lastPath = newPath;
+                  notify(newPath);
+                }
+              };
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    /** 判断路径是否为"板块根"——在这些路径上按返回键视为"退出"而非"回退"。 */
+    private fun isSectionRootPath(path: String): Boolean {
+        val normalized = path.trimEnd('/')
+        return normalized.isEmpty() || normalized in SECTION_ROOT_PATHS
     }
 
     private fun enableNativePushFromBridge() {
@@ -1390,9 +1761,11 @@ class NativeWebViewActivity : ComponentActivity() {
     override fun onDestroy() {
         mainHandler.removeCallbacks(refreshChromeColorRunnable)
         mainHandler.removeCallbacks(applyPendingChromeColorRunnable)
+        runCatching { unregisterReceiver(downloadCompleteReceiver) }
         filePathCallback?.onReceiveValue(null)
         filePathCallback = null
         webView.removeJavascriptInterface("AppNativePush")
+        webView.removeJavascriptInterface("AppDownload")
         webView.stopLoading()
         webView.webChromeClient = WebChromeClient()
         webView.webViewClient = WebViewClient()
@@ -1417,5 +1790,17 @@ class NativeWebViewActivity : ComponentActivity() {
 
         /** 与 Flutter WebView [MisskeyWebShell] 外壳层提示一致。 */
         private const val SNACK_EXIT_BACK_HINT = "再次点击返回键退出应用"
+
+        /**
+         * 板块根路径集合：用户前进导航到达这些路径时清空 WebView 历史栈，
+         * 使返回键表现为"回上级/退出"而非逐页倒带。
+         * 路径格式：不含尾部斜杠，如 "/explore"。
+         * "/" (首页) 通过 trimEnd('/') 后为空串单独判断，无需列入。
+         */
+        private val SECTION_ROOT_PATHS = setOf(
+            "/explore",
+            "/notifications",
+            "/messages",
+        )
     }
 }

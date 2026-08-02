@@ -258,7 +258,8 @@ class _MisskeyWebShellState extends State<MisskeyWebShell>
     }
   }
 
-  /// Android / iOS WebView 在长时间后台后易出现空白纹理或 JS 无响应；短间隔不打扰，长间隔 [reload]，中间先探活。
+  /// Android / iOS WebView 从后台恢复后先探活，仅在 JS 已无响应时刷新。
+  /// 不按后台时长强制刷新，避免中断或重放仍在进行的非幂等请求。
   Future<void> _recoverWebViewAfterBackground(
     Duration backgroundDuration,
   ) async {
@@ -267,20 +268,11 @@ class _MisskeyWebShellState extends State<MisskeyWebShell>
     if (!mounted || c == null) return;
 
     const minGap = Duration(seconds: 30);
-    const hardReloadGap = Duration(seconds: 75);
     if (backgroundDuration < minGap) return;
 
     final token = ++_webResumeRecoverGeneration;
 
     try {
-      if (backgroundDuration >= hardReloadGap) {
-        if (!mounted || token != _webResumeRecoverGeneration) return;
-        debugPrint(
-          '[WebShell] resumed after ${backgroundDuration.inSeconds}s background → reload WebView',
-        );
-        await c.reload();
-        return;
-      }
       await c
           .runJavaScriptReturningResult('true')
           .timeout(const Duration(seconds: 2));
