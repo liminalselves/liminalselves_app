@@ -233,11 +233,19 @@ class NativeWsManager(
 
     private fun handleChatMessage(data: JSONObject?) {
         if (data == null) return
-        val userName = displayName(data.optJSONObject("fromUser")) ?: "新消息"
+        val senderName = displayName(data.optJSONObject("fromUser")) ?: "新消息"
         val text = data.strOrNull("text")?.take(200) ?: "[附件]"
-        val fromUserId = data.strOrNull("fromUserId").orEmpty()
 
-        Log.i(TAG, "ChatMessage from $userName: ${text.take(30)}")
-        mainHandler.post { onNotification(userName, text, "/chat/user/$fromUserId") }
+        // 群聊消息：标题用群聊名，正文带发送者前缀，点击进群聊；私信：标题用发送者名，点击进私信会话
+        val roomId = data.strOrNull("toRoomId")
+        if (roomId != null) {
+            val roomName = data.optJSONObject("toRoom")?.strOrNull("name") ?: "群聊"
+            Log.i(TAG, "ChatRoomMessage [$roomName] from $senderName: ${text.take(30)}")
+            mainHandler.post { onNotification(roomName, "$senderName: $text", "/chat/room/$roomId") }
+        } else {
+            val fromUserId = data.strOrNull("fromUserId").orEmpty()
+            Log.i(TAG, "ChatMessage from $senderName: ${text.take(30)}")
+            mainHandler.post { onNotification(senderName, text, "/chat/user/$fromUserId") }
+        }
     }
 }
