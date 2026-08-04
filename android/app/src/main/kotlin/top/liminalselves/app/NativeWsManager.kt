@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * - 心跳: 每 60s 发送字符串 "h"
  * - 通知事件: {"type":"channel","body":{"id":"1","type":"notification","body":{...}}}
  * - 私信事件: {"type":"channel","body":{"id":"1","type":"newChatMessage","body":{...}}}
+ * - 智能体消息事件: {"type":"channel","body":{"id":"1","type":"newAgentMessage","body":{...}}}
  */
 class NativeWsManager(
     private val onNotification: (title: String, body: String, openPath: String?) -> Unit,
@@ -156,6 +157,7 @@ class NativeWsManager(
             when (body.optString("type")) {
                 "notification" -> handleNotification(body.optJSONObject("body"))
                 "newChatMessage" -> handleChatMessage(body.optJSONObject("body"))
+                "newAgentMessage" -> handleAgentMessage(body.optJSONObject("body"))
             }
         }.onFailure {
             Log.w(TAG, "Failed to parse WS message: ${it.message}")
@@ -247,5 +249,19 @@ class NativeWsManager(
             Log.i(TAG, "ChatMessage from $senderName: ${text.take(30)}")
             mainHandler.post { onNotification(senderName, text, "/chat/user/$fromUserId") }
         }
+    }
+
+    /**
+     * 智能体消息事件（Misskey 定制渠道 newAgentMessage，与私信 newChatMessage 对等）。
+     * payload: sessionId / sessionName / messageId / messageText / agentAvatarUrl
+     */
+    private fun handleAgentMessage(data: JSONObject?) {
+        if (data == null) return
+        val sessionName = data.strOrNull("sessionName") ?: "智能体"
+        val text = data.strOrNull("messageText")?.take(200) ?: "[消息]"
+        val sessionId = data.strOrNull("sessionId").orEmpty()
+
+        Log.i(TAG, "AgentMessage from $sessionName: ${text.take(30)}")
+        mainHandler.post { onNotification(sessionName, text, "/chat/agent/$sessionId") }
     }
 }
