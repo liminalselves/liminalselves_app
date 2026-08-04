@@ -6,3 +6,9 @@ keyPassword=填写密钥密码（常与 storePassword 相同）
 keyAlias=upload
 # 相对 android 目录的路径；也可写绝对路径
 storeFile=upload-keystore.jks
+
+# 阿里云 EMAS 推送凭证（可选，构建时注入 AndroidManifest，勿提交仓库）
+# 获取方式：阿里云 EMAS 控制台 → 移动推送 → 应用详情
+# 若不启用推送，留空即可，App 仍可正常运行（仅推送不可用）。
+aliyunAppKey=
+aliyunAppSecret=

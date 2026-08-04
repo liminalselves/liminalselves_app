@@ -18,13 +18,16 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -52,6 +55,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.pm.PackageInfoCompat
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.NotificationCompat
@@ -93,6 +97,19 @@ class NativeWebViewActivity : ComponentActivity() {
     private var currentUrl: String = defaultUrl
     private var showingErrorPage = false
     private var loadFailedForCurrentNavigation = false
+
+    // ─── WebSocket 后台保活 ────────────────────────────────────────────────
+    /** 保活是否进行中（前台服务 + CPU/网络锁），避免重复启停。 */
+    private var keepAliveActive = false
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    /** Misskey WebSocket 当前是否处于 open 状态（由 JS 桥上报），用于保活效果观测。 */
+    @Volatile
+    private var wsConnected = false
+    /** 原生 WebSocket 管理器：后台时绕过 WebView JS 节流，独立接收 Misskey 消息。 */
+    private val nativeWsManager = NativeWsManager { title, body, openPath ->
+        showSystemNotification(title, body, openPath)
+    }
 
     /** 无 WebView 历史可退时：首次返回仅提示，短时内第二次返回才 [finish]。 */
     private var lastExitBackPressElapsed = 0L
@@ -343,6 +360,7 @@ class NativeWebViewActivity : ComponentActivity() {
             builtInZoomControls = false
             displayZoomControls = false
             setSupportZoom(false)
+            setSupportMultipleWindows(true)
             userAgentString = "${userAgentString ?: ""} $marker".trim()
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -359,6 +377,7 @@ class NativeWebViewActivity : ComponentActivity() {
         webView.addJavascriptInterface(AppChromeBridge(), "AppChrome")
         webView.addJavascriptInterface(AppNavBridge(), "AppNav")
         webView.addJavascriptInterface(AppDownloadBridge(), "AppDownload")
+        webView.addJavascriptInterface(AppWsBridge(), "AppWs")
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
                 view: WebView?,
@@ -384,6 +403,7 @@ class NativeWebViewActivity : ComponentActivity() {
                 updateChromeColorFromWebPage()
                 injectLiminalAppInfo()
                 installSpaNavWatcher()
+                installWsStateWatcher()
                 reconcileStartupNotificationPermission()
                 injectNativePushStateFromPrefs()
                 onPageReadyForPushRestore()
@@ -449,6 +469,48 @@ class NativeWebViewActivity : ComponentActivity() {
 
             override fun onPermissionRequest(request: PermissionRequest?) {
                 request?.grant(request.resources)
+            }
+
+            /**
+             * 拦截 window.open()：Misskey 前端更新弹窗等场景会用 window.open 打开链接，
+             * WebView 默认不支持多窗口会静默丢弃。这里提取目标 URL：
+             * 站内域名（*.liminalselves.top）在当前 WebView 内加载；站外域名弹确认后在系统浏览器打开。
+             */
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: android.os.Message?,
+            ): Boolean {
+                val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
+                // 创建一个临时 WebView 只为获取目标 URL。
+                // 注意：必须在所有路径上销毁，否则会泄漏原生资源并可能钉住整个 Activity。
+                val tempWebView = WebView(this@NativeWebViewActivity)
+                tempWebView.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                        // 无论 url 是否为空都先销毁，避免 url==null 时提前 return 导致泄漏
+                        view?.stopLoading()
+                        view?.destroy()
+                        if (url != null) {
+                            handleWindowOpenUrl(url)
+                        }
+                    }
+
+                    override fun onReceivedError(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                        error: WebResourceError?,
+                    ) {
+                        // 导航加载失败（不会触发 onPageStarted 后续流程）时也要清理
+                        if (request?.isForMainFrame == true) {
+                            view?.stopLoading()
+                            view?.destroy()
+                        }
+                    }
+                }
+                transport.webView = tempWebView
+                resultMsg.sendToTarget()
+                return true
             }
 
             override fun onShowFileChooser(
@@ -948,6 +1010,29 @@ class NativeWebViewActivity : ComponentActivity() {
         return true
     }
 
+    /**
+     * 处理 window.open() 拦截到的 URL：
+     * 站内域名（liminalselves.top 及其子域名）在当前 WebView 内加载；
+     * 站外域名弹出确认对话框后在系统浏览器打开，避免隐式跳转。
+     */
+    private fun handleWindowOpenUrl(rawUrl: String) {
+        val uri = Uri.parse(rawUrl)
+        val host = uri.host?.lowercase().orEmpty()
+        if (host == "liminalselves.top" || host.endsWith(".liminalselves.top")) {
+            // 站内域名：在当前 WebView 内打开
+            webView.loadUrl(rawUrl)
+            return
+        }
+        // 站外域名：弹确认后在系统浏览器打开
+        val dialogCtx = ContextThemeWrapper(this, R.style.Theme_Liminal_Dialog_Host)
+        MaterialAlertDialogBuilder(dialogCtx)
+            .setTitle("即将离开站点")
+            .setMessage("当前链接不在 liminalselves.top 域内，将在系统默认浏览器中打开：\n\n${rawUrl}")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("在浏览器中打开") { _, _ -> openExternal(uri) }
+            .show()
+    }
+
     private fun openExternal(uri: Uri) {
         try {
             startActivity(Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE))
@@ -1267,13 +1352,8 @@ class NativeWebViewActivity : ComponentActivity() {
                     "disable" -> disableNativePushFromBridge()
                     "query" -> injectNativePushStateFromPrefs()
                     else -> {
-                        val payload = runCatching { JSONObject(msg ?: "") }.getOrNull()
-                        if (payload?.optString("action") == "notify") {
-                            val title = payload.optString("title", "Misskey")
-                            val body = payload.optString("body", "")
-                            val openPath = payload.optString("openPath", "").trim().takeIf { it.isNotEmpty() }
-                            showSystemNotification(title, body, openPath)
-                        }
+                        // {action:"notify"} 桥接已废弃：系统通知统一由常驻原生 WS 负责，
+                        // 避免 WebView JS 与原生 WS 双通道重复弹窗（Misskey 前端仍会发，此处静默忽略）。
                     }
                 }
             }
@@ -1357,19 +1437,84 @@ class NativeWebViewActivity : ComponentActivity() {
         return normalized.isEmpty() || normalized in SECTION_ROOT_PATHS
     }
 
-    private fun enableNativePushFromBridge() {
-        if (!areSystemNotificationsEnabled()) {
-            dispatchNativePushState(registered = false, errorCode = "permission_denied")
-            return
+    /**
+     * WebSocket 状态桥：接收 JS 层上报的 Misskey WS 连接状态（open/close/error）。
+     * 仅用于可观测性日志；常驻模式下保活不再依赖 WebView 的 WS 状态。
+     */
+    private inner class AppWsBridge {
+        @JavascriptInterface
+        fun onState(state: String?, url: String?) {
+            val s = state.orEmpty()
+            wsConnected = (s == "open")
+            Log.i(TAG, "Misskey WebSocket state=$s url=${url.orEmpty()}")
         }
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-            return
-        }
-        startNativePushAndDispatch()
     }
+
+    /**
+     * 注入 WebSocket 状态监听：包装 window.WebSocket 构造函数，
+     * 为 Misskey 建立的每条 WS 连接附加 open/close/error 监听并上报原生层。
+     * 幂等：已安装则跳过；页面重载后 JS 上下文重置，onPageFinished 会重新注入。
+     */
+    private fun installWsStateWatcher() {
+        val js = """
+            (function() {
+              if (window.__LIMINAL_WS_WATCHER_INSTALLED__) return;
+              window.__LIMINAL_WS_WATCHER_INSTALLED__ = true;
+              var OrigWS = window.WebSocket;
+              function notify(state, url) {
+                try {
+                  if (window.AppWs && window.AppWs.onState) {
+                    window.AppWs.onState(state, url || '');
+                  }
+                } catch (_) {}
+              }
+              function PatchedWS(url, protocols) {
+                var ws = (protocols === undefined) ? new OrigWS(url) : new OrigWS(url, protocols);
+                try {
+                  ws.addEventListener('open', function() { notify('open', url); });
+                  ws.addEventListener('close', function() { notify('close', url); });
+                  ws.addEventListener('error', function() { notify('error', url); });
+                } catch (_) {}
+                return ws;
+              }
+              PatchedWS.prototype = OrigWS.prototype;
+              // 保持 constructor 恒等（ws.constructor === window.WebSocket），提高包装透明度；
+              // 注：无法修复 class X extends WebSocket 的子类化场景（当前 Misskey 未使用）。
+              PatchedWS.prototype.constructor = PatchedWS;
+              PatchedWS.CONNECTING = OrigWS.CONNECTING;
+              PatchedWS.OPEN = OrigWS.OPEN;
+              PatchedWS.CLOSING = OrigWS.CLOSING;
+              PatchedWS.CLOSED = OrigWS.CLOSED;
+              window.WebSocket = PatchedWS;
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    /**
+     * 开启推送：拉起权限设置向导（逐项引导 + 返回验证），
+     * 向导完成后才执行实际启用并回报 Misskey 真实状态。
+     */
+    private fun enableNativePushFromBridge() {
+        if (pushSetupRunning) return
+        pushSetupRunning = true
+        pushSetupLauncher.launch(Intent(this, PermissionSetupActivity::class.java))
+    }
+
+    /** 是否正在运行权限向导，避免重复拉起。 */
+    private var pushSetupRunning = false
+
+    private val pushSetupLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            pushSetupRunning = false
+            if (result.resultCode == RESULT_OK) {
+                // 向导确认全部权限就绪：执行实际启用（服务端开关 + 常驻推送）
+                startNativePushAndDispatch()
+            } else {
+                // 用户取消或中途退出：回报未启用，前端开关状态回退
+                dispatchNativePushState(registered = false, errorCode = "permission_denied")
+            }
+        }
 
     private fun startNativePushAndDispatch() {
         if (!areSystemNotificationsEnabled()) {
@@ -1378,9 +1523,21 @@ class NativeWebViewActivity : ComponentActivity() {
         }
         AliyunPushStarter.start(application) { ok, _, err ->
             if (!ok) {
-                runOnUiThread {
-                    Log.w(TAG, "native push setup failed: ${err ?: "unknown"}")
-                    dispatchNativePushState(registered = false, errorCode = "push_setup_failed")
+                // EMAS 未配置或初始化失败：跳过设备注册，仅同步服务端 enableAppPush 开关。
+                // 这样"APP推送通知"开关仍可作为全局推送总开关控制 WS 保活，
+                // 只是没有阿里云离线推送能力（在线时 WS 消息照常送达）。
+                Log.i(TAG, "EMAS unavailable, skipping device registration; enabling server push flag only")
+                updateAppPushFlagOnMisskey(true) { updated ->
+                    runOnUiThread {
+                        if (updated) {
+                            getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, true).apply()
+                            // 开关打开：立即拉起常驻推送（原生 WS + 前台服务）
+                            ensureNativePushRunning()
+                            dispatchNativePushState(registered = true, errorCode = null)
+                        } else {
+                            dispatchNativePushState(registered = false, errorCode = "push_setup_failed")
+                        }
+                    }
                 }
                 return@start
             }
@@ -1388,6 +1545,8 @@ class NativeWebViewActivity : ComponentActivity() {
             syncEnableStateWithMisskey { synced ->
                 if (synced) {
                     getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, true).apply()
+                    // 开关打开：立即拉起常驻推送（原生 WS + 前台服务）
+                    runOnUiThread { ensureNativePushRunning() }
                     dispatchNativePushState(registered = true, errorCode = null)
                 } else {
                     // 服务端未同步成功时回滚本地状态
@@ -1409,6 +1568,8 @@ class NativeWebViewActivity : ComponentActivity() {
             AliyunPushStarter.stop()
             getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, false).apply()
             nativePushRestoreAttempted = false
+            // 开关关闭：立即停止常驻推送（原生 WS + 前台服务），避免无推送时仍耗电
+            stopNativePushAll()
             dispatchNativePushState(registered = false, errorCode = null)
         }
     }
@@ -1424,6 +1585,8 @@ class NativeWebViewActivity : ComponentActivity() {
             // 按钮状态只反映服务端 enableAppPush，避免“已启用但刷新回到启用按钮”
             // 系统通知权限只影响实际投递能力，不应反向覆盖服务端开关显示
             getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, serverEnabled).apply()
+            // 服务端同步后：对齐常驻推送状态（开启则拉起，关闭则全部停止）
+            if (serverEnabled) ensureNativePushRunning() else stopNativePushAll()
             val permissionError = if (serverEnabled && !areSystemNotificationsEnabled()) "permission_denied" else null
             dispatchNativePushState(registered = serverEnabled, errorCode = permissionError)
         }
@@ -1504,25 +1667,29 @@ class NativeWebViewActivity : ComponentActivity() {
 
     private fun showSystemNotification(title: String, body: String, openPath: String? = null) {
         // 以本地 pref 为门控：只有用户明确启用了 App 推送才弹系统通知
-        if (!getPrefs().getBoolean(PREF_NATIVE_PUSH_ENABLED, false)) return
-        if (!areSystemNotificationsEnabled()) return
+        if (!getPrefs().getBoolean(PREF_NATIVE_PUSH_ENABLED, false)) {
+            Log.w(TAG, "showSystemNotification skipped: PREF_NATIVE_PUSH_ENABLED is false")
+            return
+        }
+        if (!areSystemNotificationsEnabled()) {
+            Log.w(TAG, "showSystemNotification skipped: system notifications disabled")
+            return
+        }
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) return
+        ) {
+            Log.w(TAG, "showSystemNotification skipped: POST_NOTIFICATIONS not granted")
+            return
+        }
+        Log.i(TAG, "showSystemNotification: title=$title, body=${body.take(50)}")
 
-        val channelId = "misskey_ws_live"
+        // 分级通知：私信（openPath 以 /chat 开头）走高优先级渠道（弹窗+声音+震动，仿微信），
+        // 其余 Misskey 通知走低优先级渠道（仅通知栏，不弹窗不震动）。
+        val isChat = openPath?.startsWith("/chat") == true
+        val channelId = if (isChat) CHANNEL_MISSKEY_CHAT else CHANNEL_MISSKEY_NOTIFY
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            if (nm.getNotificationChannel(channelId) == null) {
-                val channel = NotificationChannel(
-                    channelId,
-                    "Misskey 实时通知",
-                    NotificationManager.IMPORTANCE_HIGH,
-                ).apply {
-                    description = "App 在线时通过 WebSocket 转发的实时通知"
-                }
-                nm.createNotificationChannel(channel)
-            }
+            ensureNotificationChannels(nm)
         }
 
         val targetUrl = openPath?.takeIf { isSafeMisskeyOpenPath(it) }?.let { absoluteUrlForMisskeyPath(it) } ?: currentUrl
@@ -1541,24 +1708,42 @@ class NativeWebViewActivity : ComponentActivity() {
         )
 
         val contentText = body.trim().ifBlank { "你有一条新通知" }.take(200)
-        val notification = NotificationCompat.Builder(this, channelId)
+        val builder = NotificationCompat.Builder(this, channelId)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle(title.take(64))
             .setContentText(contentText)
             .setStyle(NotificationCompat.BigTextStyle().bigText(contentText))
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .build()
+        if (isChat) {
+            // 私信：弹窗（heads-up）+ 声音 + 震动，仿微信
+            builder.setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setDefaults(NotificationCompat.DEFAULT_ALL)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+        } else {
+            // 互动通知：静默进通知栏，不弹窗不震动
+            builder.setPriority(NotificationCompat.PRIORITY_LOW)
+                .setSilent(true)
+        }
 
-        NotificationManagerCompat.from(this).notify(notificationId, notification)
+        NotificationManagerCompat.from(this).notify(notificationId, builder.build())
+    }
+
+    /**
+     * 确保通知渠道就绪（幂等）：私信渠道 HIGH（弹窗+声音+震动）、互动渠道 LOW（静默）。
+     * 注意：渠道创建后重要性只能被用户降、不能被代码升，降级场景由权限向导页引导。
+     */
+    private fun ensureNotificationChannels(nm: NotificationManager) {
+        ensureMisskeyChannels(this)
     }
 
     private fun onPageReadyForPushRestore() {
-        if (nativePushRestoreAttempted) return
+        // 页面加载完成（含登录/切换账号后）：对齐常驻推送状态。
+        // 每次页面就绪都检查，以覆盖"开启开关时未登录→登录后自动拉起"的边界；
+        // ensureNativePushRunning 幂等，重复调用无副作用。
         if (!getPrefs().getBoolean(PREF_NATIVE_PUSH_ENABLED, false)) return
         nativePushRestoreAttempted = true
-        enableNativePushFromBridge()
+        ensureNativePushRunning()
     }
 
     private fun registerMobilePushWithMisskey(deviceId: String, cb: (Boolean) -> Unit) {
@@ -1731,17 +1916,112 @@ class NativeWebViewActivity : ComponentActivity() {
 
     override fun onPause() {
         mainHandler.removeCallbacks(refreshChromeColorRunnable)
+        // 原生 WS 与前台服务常驻，不随前后台切换启停（避免熄屏/点亮反复启停）；
+        // 这里只负责 WebView 自身的暂停/恢复。
+        if (isFinishing) {
+            stopNativePushAll()
+        }
         webView.onPause()
         super.onPause()
     }
 
     override fun onResume() {
         super.onResume()
-        applyPersistentSystemBars()
         webView.onResume()
+        applyPersistentSystemBars()
+        // 自愈：若前台服务曾被系统回收但推送开关仍开启，回前台时恢复。
+        ensureNativePushRunning()
         // 先用缓存色立即压回去，再合并恢复/焦点事件后统一从网页校正。
         applySystemBarColor(lastChromeColor)
         scheduleChromeColorRefresh(180)
+    }
+
+    /**
+     * 常驻推送基础设施：前台服务（提升进程优先级 + 常驻通知）
+     * + Partial WakeLock（保持 CPU 运行，使原生 WS 心跳不被系统休眠中断）
+     * + WifiLock（保持 WiFi 活跃）。
+     * 推送开关开启期间持续运行，仅用户关闭开关/退出登录/退出 App 时停止；
+     * 不再随前后台/熄屏切换启停。
+     */
+    private fun startWebSocketKeepAlive() {
+        if (keepAliveActive) return
+        keepAliveActive = true
+        runCatching {
+            val intent = Intent(this, KeepAliveService::class.java)
+                .setAction(KeepAliveService.ACTION_START)
+            ContextCompat.startForegroundService(this, intent)
+        }.onFailure { Log.w(TAG, "start KeepAliveService failed: ${it.message}") }
+        runCatching {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "liminal:ws-keepalive").apply {
+                setReferenceCounted(false)
+                // 常驻模式：不设超时，随 stopWebSocketKeepAlive 释放
+                if (!isHeld) acquire()
+            }
+        }.onFailure { Log.w(TAG, "acquire WakeLock failed: ${it.message}") }
+        runCatching {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                @Suppress("DEPRECATION")
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wifiLock = wm.createWifiLock(mode, "liminal:ws-wifi").apply {
+                setReferenceCounted(false)
+                if (!isHeld) acquire()
+            }
+        }.onFailure { Log.w(TAG, "acquire WifiLock failed: ${it.message}") }
+        Log.i(TAG, "Push keep-alive started (persistent)")
+    }
+
+    private fun stopWebSocketKeepAlive() {
+        if (!keepAliveActive) return
+        keepAliveActive = false
+        runCatching {
+            val intent = Intent(this, KeepAliveService::class.java)
+                .setAction(KeepAliveService.ACTION_STOP)
+            startService(intent)
+        }
+        runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
+        wakeLock = null
+        runCatching { wifiLock?.takeIf { it.isHeld }?.release() }
+        wifiLock = null
+        Log.i(TAG, "Push keep-alive stopped")
+    }
+
+    /**
+     * 确保常驻推送正在运行（幂等）：推送开关开启 + 已登录（有 token）时，
+     * 启动前台服务与原生 WS。未登录时静默等待，页面加载完成后会再次尝试。
+     */
+    private fun ensureNativePushRunning() {
+        if (isFinishing || isDestroyed) return
+        if (!getPrefs().getBoolean(PREF_NATIVE_PUSH_ENABLED, false)) return
+        readMisskeyToken { token ->
+            if (isFinishing || isDestroyed) return@readMisskeyToken
+            if (!getPrefs().getBoolean(PREF_NATIVE_PUSH_ENABLED, false)) return@readMisskeyToken
+            if (token.isNullOrBlank()) {
+                // 未登录：若原生 WS 仍在用旧 token 跑则停掉，等登录后由页面加载回调拉起
+                if (nativeWsManager.isRunning()) {
+                    Log.i(TAG, "Token gone (logged out?), stopping native push")
+                    stopNativePushAll()
+                }
+                return@readMisskeyToken
+            }
+            getPrefs().edit().putString(PREF_LAST_MISSKEY_TOKEN, token).apply()
+            if (!nativeWsManager.isRunning()) {
+                Log.i(TAG, "Starting resident native WS")
+                nativeWsManager.start(token, getMisskeyOrigin())
+            }
+            // 前台服务可能被系统回收过：补拉一次（幂等）
+            if (!keepAliveActive) startWebSocketKeepAlive()
+        }
+    }
+
+    /** 停止常驻推送：原生 WS + 前台服务/锁全部关闭（关开关/退出登录/退出 App）。 */
+    private fun stopNativePushAll() {
+        nativeWsManager.stop()
+        stopWebSocketKeepAlive()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -1761,11 +2041,17 @@ class NativeWebViewActivity : ComponentActivity() {
     override fun onDestroy() {
         mainHandler.removeCallbacks(refreshChromeColorRunnable)
         mainHandler.removeCallbacks(applyPendingChromeColorRunnable)
+        // 常驻模式：仅 Activity finish（用户退出 App）时停止推送；
+        // 系统回收重建场景不停止，交由 onPause(isFinishing) 处理。
+        if (isFinishing) {
+            stopNativePushAll()
+        }
         runCatching { unregisterReceiver(downloadCompleteReceiver) }
         filePathCallback?.onReceiveValue(null)
         filePathCallback = null
         webView.removeJavascriptInterface("AppNativePush")
         webView.removeJavascriptInterface("AppDownload")
+        webView.removeJavascriptInterface("AppWs")
         webView.stopLoading()
         webView.webChromeClient = WebChromeClient()
         webView.webViewClient = WebViewClient()
@@ -1787,6 +2073,75 @@ class NativeWebViewActivity : ComponentActivity() {
 
         /** 两次返回间隔不超过该值则退出 Activity（与 [Snackbar.LENGTH_SHORT] 接近）。 */
         private const val EXIT_CONFIRM_MS = 2000L
+
+        /** 私信消息渠道：高优先级（弹窗+声音+震动）。供权限向导页共用。 */
+        const val CHANNEL_MISSKEY_CHAT = "misskey_chat_v2"
+
+        /** 互动通知渠道：低优先级（仅通知栏，不弹窗不震动）。供权限向导页共用。 */
+        const val CHANNEL_MISSKEY_NOTIFY = "misskey_notify_v2"
+
+        /** 确保私信渠道存在（幂等），供 [PermissionSetupActivity] 向导页共用。 */
+        fun ensureChatChannel(context: Context) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (nm.getNotificationChannel(CHANNEL_MISSKEY_CHAT) == null) {
+                nm.createNotificationChannel(
+                    NotificationChannel(
+                        CHANNEL_MISSKEY_CHAT,
+                        "私信消息",
+                        NotificationManager.IMPORTANCE_HIGH,
+                    ).apply {
+                        description = "私信消息：弹窗提醒，声音与震动"
+                        enableVibration(true)
+                        enableLights(true)
+                    },
+                )
+            }
+        }
+
+        /** 确保互动通知渠道存在（幂等），供 [PermissionSetupActivity] 向导页共用。 */
+        fun ensureNotifyChannel(context: Context) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (nm.getNotificationChannel(CHANNEL_MISSKEY_NOTIFY) == null) {
+                nm.createNotificationChannel(
+                    NotificationChannel(
+                        CHANNEL_MISSKEY_NOTIFY,
+                        "互动通知",
+                        NotificationManager.IMPORTANCE_LOW,
+                    ).apply {
+                        description = "提及/回复/反应/关注等互动通知：仅通知栏展示，不弹窗不震动"
+                        setShowBadge(true)
+                        setSound(null, null)
+                        enableVibration(false)
+                    },
+                )
+            }
+        }
+
+        /**
+         * 清理历史遗留渠道（幂等、低成本）：
+         * - misskey_push：阿里云 EMAS 推送渠道，EMAS 已停用；
+         * - misskey_ws_live / misskey_ws_live_v2：旧单渠道方案已废弃；
+         * - liminalselves_keepalive：旧保活渠道，已被 v2 取代。
+         */
+        fun cleanupLegacyChannels(context: Context) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            listOf("misskey_push", "misskey_ws_live", "misskey_ws_live_v2", "liminalselves_keepalive").forEach { id ->
+                runCatching { nm.deleteNotificationChannel(id) }
+            }
+        }
+
+        /** 确保 Misskey 相关渠道全部就绪（遗留清理 + 私信 + 互动），供向导页共用。 */
+        fun ensureMisskeyChannels(context: Context) {
+            cleanupLegacyChannels(context)
+            ensureChatChannel(context)
+            ensureNotifyChannel(context)
+        }
+
+        /** 缓存的 Misskey token：供 WebView 暂停后原生 WS 启动兜底使用。 */
+        private const val PREF_LAST_MISSKEY_TOKEN = "liminal_last_misskey_token"
 
         /** 与 Flutter WebView [MisskeyWebShell] 外壳层提示一致。 */
         private const val SNACK_EXIT_BACK_HINT = "再次点击返回键退出应用"

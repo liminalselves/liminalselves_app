@@ -17,4 +17,16 @@
     <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
         <item name="android:windowBackground">?android:colorBackground</item>
     </style>
+
+    <!-- 权限向导页专用主题（Android 12+ 深色模式）：仍保持浅色，与主页壳层一致 -->
+    <style name="Theme.Liminal.Wizard" parent="@android:style/Theme.Light.NoTitleBar">
+        <item name="android:windowBackground">#F7F9F5</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:forceDarkAllowed">false</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
 </resources>

@@ -74,9 +74,13 @@ class MainActivity : ComponentActivity() {
     private fun checkVersionAndContinue() {
         val prefs = getSharedPreferences(PREFS_UPDATE_GATE, Context.MODE_PRIVATE)
         val cachedJson = prefs.getString(KEY_META_JSON, null)
-        val cacheAge = System.currentTimeMillis() - prefs.getLong(KEY_META_SAVED_AT, 0L)
-        if (!cachedJson.isNullOrBlank() && cacheAge in 0 until META_CACHE_TTL_MS) {
+
+        // stale-while-revalidate：有缓存时立即放行（保证启动速度），同时后台刷新缓存供下次启动使用；
+        // 无缓存（首次启动）才同步等待网络请求。这样既避免每次冷启动都阻塞于网络，
+        // 又能让版本更新提示在下一次启动时及时生效（而非旧 3 小时缓存的长时间滞后）。
+        if (!cachedJson.isNullOrBlank()) {
             applyUpdatePolicy(cachedJson)
+            refreshMetaInBackground(prefs)
             return
         }
 
@@ -96,6 +100,19 @@ class MainActivity : ComponentActivity() {
                 } else {
                     applyUpdatePolicy(usableJson)
                 }
+            }
+        }
+    }
+
+    /** 后台刷新 meta 缓存（不阻塞当前启动），供下一次启动时及时获得最新版本信息。 */
+    private fun refreshMetaInBackground(prefs: android.content.SharedPreferences) {
+        ioExecutor.execute {
+            val freshJson = fetchMeta()
+            if (freshJson != null) {
+                prefs.edit()
+                    .putString(KEY_META_JSON, freshJson)
+                    .putLong(KEY_META_SAVED_AT, System.currentTimeMillis())
+                    .apply()
             }
         }
     }
@@ -292,7 +309,6 @@ class MainActivity : ComponentActivity() {
         private const val PREFS_UPDATE_GATE = "native_update_gate"
         private const val KEY_META_JSON = "meta_json"
         private const val KEY_META_SAVED_AT = "meta_saved_at"
-        private const val META_CACHE_TTL_MS = 3 * 60 * 60 * 1000L
         private const val META_CONNECT_TIMEOUT_MS = 2_500
         private const val META_READ_TIMEOUT_MS = 2_500
         private const val APP_ACCENT_COLOR = -15043608

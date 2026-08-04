@@ -29,4 +29,15 @@
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowLightNavigationBar" tools:targetApi="o_mr1">true</item>
     </style>
+
+    <!-- 权限向导页专用主题：即使系统处于深色模式也保持浅色，与主页壳层一致 -->
+    <style name="Theme.Liminal.Wizard" parent="@android:style/Theme.Light.NoTitleBar">
+        <item name="android:windowBackground">#F7F9F5</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="o_mr1">true</item>
+        <item name="android:forceDarkAllowed" tools:targetApi="q">false</item>
+    </style>
 </resources>

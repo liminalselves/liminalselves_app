@@ -35,6 +35,13 @@ val escapedMisskeyUrl = misskeyUrl
     .replace("\\", "\\\\")
     .replace("\"", "\\\"")
 
+// 阿里云 EMAS 推送凭证：从 key.properties（已 gitignore）读取，构建时注入 Manifest，
+// 避免把 appkey/appsecret 硬编码进被版本控制的 AndroidManifest.xml。
+// 当前推送已停用（阿里云应用已删除），凭证留空；SDK 与接口代码保留，
+// 重建应用后只需在 key.properties 填入新值即可恢复推送。
+val aliyunAppKey = keystoreProperties.getProperty("aliyunAppKey").orEmpty()
+val aliyunAppSecret = keystoreProperties.getProperty("aliyunAppSecret").orEmpty()
+
 android {
     namespace = "top.liminalselves.app"
     compileSdk = flutter.compileSdkVersion
@@ -60,6 +67,8 @@ android {
         }
         multiDexEnabled = true
         buildConfigField("String", "MISSKEY_URL", "\"$escapedMisskeyUrl\"")
+        manifestPlaceholders["ALIYUN_APP_KEY"] = aliyunAppKey
+        manifestPlaceholders["ALIYUN_APP_SECRET"] = aliyunAppSecret
     }
 
     buildFeatures {
@@ -114,6 +123,8 @@ dependencies {
     implementation("com.aliyun.ams:alicloud-android-push:3.8.4")
     implementation("androidx.multidex:multidex:2.0.1")
     implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
+    // 原生 WebSocket：后台保活时绕过 WebView JS 节流，独立接收 Misskey Streaming 消息
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
 
 flutter {

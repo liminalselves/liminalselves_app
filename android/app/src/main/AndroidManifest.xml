@@ -11,6 +11,12 @@
         android:required="false" />
     <!-- Android 13+ 通知权限（阿里云推送 SDK 3.8.4+ 会处理，此处显式声明） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- WebSocket 后台保活：前台服务 + CPU/网络锁，维持 WebView 中的长连接 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 开启推送时主动申请电池优化豁免，保障常驻原生 WS 不被 Doze/省电策略断网 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:label="阈界人格"
@@ -23,14 +29,14 @@
         <meta-data
             android:name="io.flutter.embedding.android.EnableImpeller"
             android:value="false" />
-        <!-- Aliyun Push: 使用官方推荐的 Manifest + init(context) 方式初始化 -->
+        <!-- Aliyun Push: appkey/appsecret 由 Gradle 从 key.properties（已 gitignore）注入，
+             勿在此硬编码真实凭证（本文件被版本控制）。 -->
         <meta-data
             android:name="com.alibaba.app.appkey"
-            android:value="335689498" />
+            android:value="${ALIYUN_APP_KEY}" />
         <meta-data
             android:name="com.alibaba.app.appsecret"
-            android:value="d1256735abf9469d8ce1a35966510e91" />
-        <!-- 线上建议改为安全方案（如后端下发/加固），此处为当前可运行配置。 -->
+            android:value="${ALIYUN_APP_SECRET}" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -60,6 +66,12 @@
             android:theme="@style/NormalTheme"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize" />
+        <!-- 推送权限设置向导：逐项引导开启通知/电池豁免/悬浮通知。
+             使用专用主题（各 values 变体均有定义），保证系统栏与主页壳层一致的浅色。 -->
+        <activity
+            android:name=".PermissionSetupActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Liminal.Wizard" />
         <service
             android:name=".KeepAliveService"
             android:foregroundServiceType="dataSync"

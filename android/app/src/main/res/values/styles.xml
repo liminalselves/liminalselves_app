@@ -31,6 +31,20 @@
         <item name="android:windowLightNavigationBar" tools:targetApi="o_mr1">true</item>
     </style>
 
+    <!-- 权限向导页专用主题：浅色背景 + 透明系统栏 + 深色图标，
+         与主页 WebView 的浅色系统栏保持一致，避免进入向导页时上下栏突变深。
+         系统栏颜色必须在主题中声明（各 values 变体各自定义），
+         仅靠代码设置在高版本 Android/部分 ROM 上不可靠。 -->
+    <style name="Theme.Liminal.Wizard" parent="@android:style/Theme.Light.NoTitleBar">
+        <item name="android:windowBackground">#F7F9F5</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="o_mr1">true</item>
+        <item name="android:forceDarkAllowed" tools:targetApi="q">false</item>
+    </style>
+
     <!--
       对话框宿主主题：完整的 Material 3 Theme，仅用于包装对话框 Context。
       因为 NativeWebViewActivity 继承 ComponentActivity 且基础主题不是 Material，

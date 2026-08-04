@@ -23,4 +23,18 @@
     <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
         <item name="android:windowBackground">?android:colorBackground</item>
     </style>
+
+    <!-- 权限向导页专用主题（Android 12+）：
+         本变体此前未声明系统栏颜色，导致向导页落入裸主题默认深色系统栏。
+         透明栏 + 浅色图标，与主页 WebView 一致。 -->
+    <style name="Theme.Liminal.Wizard" parent="@android:style/Theme.Light.NoTitleBar">
+        <item name="android:windowBackground">#F7F9F5</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:forceDarkAllowed">false</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
 </resources>
