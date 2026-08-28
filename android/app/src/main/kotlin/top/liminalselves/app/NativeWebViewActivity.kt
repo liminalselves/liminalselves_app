@@ -7,6 +7,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
+import android.content.ContentValues
 import android.content.res.ColorStateList
 import android.content.ActivityNotFoundException
 import android.content.Context
@@ -18,6 +19,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.media.MediaScannerConnection
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
@@ -179,25 +181,36 @@ class NativeWebViewActivity : ComponentActivity() {
         }
 
     // ─── 文件下载 ───────────────────────────────────────────────────────────
-    private data class PendingDownload(
-        val url: String,
-        val fileName: String,
-        val mimeType: String,
-        val userAgent: String?,
-    )
-    private var pendingDownload: PendingDownload? = null
+    // 存储权限获批后需要重放的下载动作（授权弹窗期间挂起，授予后继续执行）。
+    private var pendingDownloadAction: (() -> Unit)? = null
 
     private val storagePermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            val dl = pendingDownload
-            pendingDownload = null
-            if (dl == null) return@registerForActivityResult
+            val action = pendingDownloadAction
+            pendingDownloadAction = null
+            if (action == null) return@registerForActivityResult
             if (granted) {
-                startDownloadWithManager(dl.url, dl.fileName, dl.mimeType, dl.userAgent)
+                action()
             } else {
                 Toast.makeText(this, "存储权限被拒绝，无法保存文件", Toast.LENGTH_SHORT).show()
             }
         }
+
+    /**
+     * 写公共下载目录的统一权限门控：API 29+ 经 MediaStore 写入自身贡献的文件无需权限；
+     * API ≤ 28 直写公共目录需要 WRITE_EXTERNAL_STORAGE，未授予时先申请，获批后重放
+     * [action]（blob 场景届时仍可从 shim 缓存读取 Blob 引用）。
+     */
+    private fun ensurePublicDownloadPermissionThen(action: () -> Unit) {
+        if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P ||
+            checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        ) {
+            action()
+            return
+        }
+        pendingDownloadAction = action
+        storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+    }
 
     private val downloadCompleteReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -414,6 +427,7 @@ class NativeWebViewActivity : ComponentActivity() {
                 injectLiminalAppInfo()
                 installSpaNavWatcher()
                 installWsStateWatcher()
+                installBlobDownloadShim()
                 reconcileStartupNotificationPermission()
                 injectNativePushStateFromPrefs()
                 onPageReadyForPushRestore()
@@ -1219,21 +1233,11 @@ class NativeWebViewActivity : ComponentActivity() {
         val mime = mimetype?.takeIf { it.isNotBlank() }
             ?: guessMimeType(fileName, url)
 
+        // 三类下载统一保存到公共 Download/ 目录，权限策略一致（29+ 免权限，≤28 先申请再重放）。
         when {
-            url.startsWith("blob:") -> downloadBlobViaJs(url, fileName, mime)
-            url.startsWith("data:") -> saveDataUrl(url, fileName, mime)
-            else -> {
-                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-                    if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                        != PackageManager.PERMISSION_GRANTED
-                    ) {
-                        pendingDownload = PendingDownload(url, fileName, mime, userAgent)
-                        storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                        return
-                    }
-                }
-                startDownloadWithManager(url, fileName, mime, userAgent)
-            }
+            url.startsWith("blob:") -> ensurePublicDownloadPermissionThen { downloadBlobViaJs(url, fileName, mime) }
+            url.startsWith("data:") -> ensurePublicDownloadPermissionThen { saveDataUrl(url, fileName, mime) }
+            else -> ensurePublicDownloadPermissionThen { startDownloadWithManager(url, fileName, mime, userAgent) }
         }
     }
 
@@ -1270,22 +1274,87 @@ class NativeWebViewActivity : ComponentActivity() {
     }
 
     /**
-     * blob: URL 无法被 DownloadManager 处理，通过 JS fetch 转为 base64 后回传原生层保存。
+     * 注入 Blob 下载 shim：包装 URL.createObjectURL，为每个 blob: URL 保留 Blob 引用
+     * （有界缓存，防止大 Blob 长期滞留内存）。
+     *
+     * 背景：Misskey 前端导出文件的做法是 createObjectURL → a.click() →
+     * setTimeout(0) 内 revokeObjectURL。原生 DownloadListener 回调与 evaluateJavascript
+     * 注入均为异步往返，必然晚于 revoke 执行，此时再 fetch(blob:URL) 会抛
+     * "Failed to fetch"。而 revoke 只注销 URL 映射、不销毁 Blob 本体，
+     * 因此在创建时持有 Blob 引用，下载时即可绕过已被注销的 URL 直接读取。
+     * 幂等：已安装则跳过；页面重载后 JS 上下文重置，onPageFinished 会重新注入。
+     */
+    private fun installBlobDownloadShim() {
+        val js = """
+            (function() {
+              if (window.__LIMINAL_BLOB_SHIM_INSTALLED__) return;
+              window.__LIMINAL_BLOB_SHIM_INSTALLED__ = true;
+              var MAX_ENTRIES = 16;
+              var MAX_TOTAL_BYTES = 32 * 1024 * 1024;
+              var entries = [];
+              var origCreate = URL.createObjectURL.bind(URL);
+              URL.createObjectURL = function(blob) {
+                var url = origCreate(blob);
+                try {
+                  if (blob && typeof blob.size === 'number') {
+                    entries.push({ url: url, blob: blob });
+                    var total = 0;
+                    for (var i = 0; i < entries.length; i++) total += entries[i].blob.size;
+                    while (entries.length > 0 &&
+                           (entries.length > MAX_ENTRIES || total > MAX_TOTAL_BYTES)) {
+                      var evicted = entries.shift();
+                      total -= evicted.blob.size;
+                    }
+                  }
+                } catch (_) {}
+                return url;
+              };
+              window.__LIMINAL_BLOB_STORE__ = {
+                // 非破坏性读取：低版本 Android 存储权限弹窗会延迟重放下载流程，
+                // 届时需再次取到同一 Blob；缓存本身有界，条目靠逐出回收。
+                peek: function(url) {
+                  for (var i = 0; i < entries.length; i++) {
+                    if (entries[i].url === url) return entries[i].blob;
+                  }
+                  return null;
+                },
+              };
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    /**
+     * blob: URL 无法被 DownloadManager 处理，转为 base64 后回传原生层保存。
+     * 优先从 [installBlobDownloadShim] 缓存的 Blob 引用直接读取——页面通常在触发
+     * 下载后立即 revokeObjectURL，之后再 fetch 该 URL 会失败；缓存未命中
+     * （shim 未注入或条目被逐出）时回退到 fetch 路径。
      */
     private fun downloadBlobViaJs(blobUrl: String, fileName: String, mimeType: String) {
         val escapedUrl = blobUrl.replace("\\", "\\\\").replace("'", "\\'")
+        val escapedName = fileName.replace("\\", "\\\\").replace("'", "\\'")
+        val escapedMime = mimeType.replace("\\", "\\\\").replace("'", "\\'")
         val js = """
             (function() {
+              function deliver(blob) {
+                var reader = new FileReader();
+                reader.onloadend = function() {
+                  var base64 = reader.result.split(',')[1] || '';
+                  window.AppDownload && window.AppDownload.onBlobReady(base64, '$escapedName', '$escapedMime');
+                };
+                reader.onerror = function() {
+                  window.AppDownload && window.AppDownload.onBlobError('read blob failed');
+                };
+                reader.readAsDataURL(blob);
+              }
+          var tracked = null;
+          try {
+            tracked = window.__LIMINAL_BLOB_STORE__ && window.__LIMINAL_BLOB_STORE__.peek('$escapedUrl');
+          } catch (_) {}
+              if (tracked) { deliver(tracked); return; }
               fetch('$escapedUrl')
                 .then(function(r) { return r.blob(); })
-                .then(function(blob) {
-                  var reader = new FileReader();
-                  reader.onloadend = function() {
-                    var base64 = reader.result.split(',')[1] || '';
-                    window.AppDownload && window.AppDownload.onBlobReady(base64, '$fileName', '$mimeType');
-                  };
-                  reader.readAsDataURL(blob);
-                })
+                .then(deliver)
                 .catch(function(e) {
                   window.AppDownload && window.AppDownload.onBlobError(e.message || 'fetch failed');
                 });
@@ -1294,24 +1363,70 @@ class NativeWebViewActivity : ComponentActivity() {
         webView.evaluateJavascript(js, null)
     }
 
-    /** data: URL 直接解码保存。 */
+    /** data: URL 直接解码后保存到公共下载目录。 */
     private fun saveDataUrl(dataUrl: String, fileName: String, mimeType: String) {
         ioExecutor.execute {
-            runCatching {
-                val base64Part = dataUrl.substringAfter(",")
-                val bytes = android.util.Base64.decode(base64Part, android.util.Base64.DEFAULT)
-                val file = File(
-                    getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
-                    uniqueFileName(fileName),
-                )
-                FileOutputStream(file).use { it.write(bytes) }
-                mainHandler.post {
-                    Toast.makeText(this, "已保存: ${file.name}", Toast.LENGTH_SHORT).show()
-                }
-            }.onFailure {
+            val bytes = runCatching {
+                android.util.Base64.decode(dataUrl.substringAfter(","), android.util.Base64.DEFAULT)
+            }.getOrElse {
                 mainHandler.post {
                     Toast.makeText(this, "保存失败: ${it.message}", Toast.LENGTH_SHORT).show()
                 }
+                return@execute
+            }
+            saveBytesToPublicDownloads(bytes, fileName, mimeType)
+        }
+    }
+
+    /**
+     * 将下载得到的字节保存到公共下载目录（/storage/emulated/0/Download/），与 HTTP 下载
+     * 走系统 DownloadManager 的落盘位置保持一致：
+     * - API 29+：经 MediaStore.Downloads 写入自身贡献的文件，无需存储权限；同名文件
+     *   由 MediaStore 自动追加序号，写入完成后读回实际文件名用于提示。
+     * - API ≤ 28：直写公共目录（调用前需已通过 [ensurePublicDownloadPermissionThen]
+     *   获得权限），并主动触发媒体扫描让文件立即可见。
+     * 须在后台线程调用。
+     */
+    private fun saveBytesToPublicDownloads(bytes: ByteArray, fileName: String, mimeType: String) {
+        runCatching {
+            val savedName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val resolver = contentResolver
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val contentUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: throw IllegalStateException("MediaStore insert failed")
+                resolver.openOutputStream(contentUri)?.use { it.write(bytes) }
+                    ?: throw IllegalStateException("openOutputStream failed")
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                resolver.update(contentUri, values, null, null)
+                // 同名文件由 MediaStore 自动追加序号，读回实际文件名用于提示
+                resolver.query(
+                    contentUri,
+                    arrayOf(MediaStore.Downloads.DISPLAY_NAME),
+                    null,
+                    null,
+                    null,
+                )?.use { c -> if (c.moveToFirst()) c.getString(0) else null } ?: fileName
+            } else {
+                @Suppress("DEPRECATION")
+                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                if (!dir.exists()) dir.mkdirs()
+                val file = File(dir, uniqueFileName(dir, fileName))
+                FileOutputStream(file).use { it.write(bytes) }
+                MediaScannerConnection.scanFile(this, arrayOf(file.absolutePath), arrayOf(mimeType), null)
+                file.name
+            }
+            mainHandler.post {
+                Toast.makeText(this, "已保存到 Download/: $savedName", Toast.LENGTH_SHORT).show()
+            }
+        }.onFailure {
+            Log.w(TAG, "Save public download failed: ${it.message}")
+            mainHandler.post {
+                Toast.makeText(this, "保存失败: ${it.message}", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -1351,9 +1466,9 @@ class NativeWebViewActivity : ComponentActivity() {
             }
     }
 
-    /** 文件名冲突时自动追加序号。 */
-    private fun uniqueFileName(name: String): String {
-        val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: return name
+    /** 文件名冲突时自动追加序号（在 [dir] 内探测）。 */
+    private fun uniqueFileName(dir: File?, name: String): String {
+        if (dir == null) return name
         val base = name.substringBeforeLast('.', name)
         val ext = name.substringAfterLast('.', "")
         var candidate = name
@@ -1365,12 +1480,13 @@ class NativeWebViewActivity : ComponentActivity() {
         return candidate
     }
 
-    /** blob 下载桥：接收 JS 层回传的 base64 数据并保存为文件。 */
+    /** blob 下载桥：接收 JS 层回传的 base64 数据并保存到公共下载目录。 */
     private inner class AppDownloadBridge {
         @JavascriptInterface
         fun onBlobReady(base64: String?, fileName: String?, mimeType: String?) {
             val data = base64.orEmpty()
             val name = fileName?.takeIf { it.isNotBlank() } ?: "download_${System.currentTimeMillis()}"
+            val mime = mimeType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
             if (data.isEmpty()) {
                 runOnUiThread { Toast.makeText(this@NativeWebViewActivity, "下载失败: 空数据", Toast.LENGTH_SHORT).show() }
                 return
@@ -1378,14 +1494,7 @@ class NativeWebViewActivity : ComponentActivity() {
             ioExecutor.execute {
                 runCatching {
                     val bytes = android.util.Base64.decode(data, android.util.Base64.DEFAULT)
-                    val file = File(
-                        getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
-                        uniqueFileName(name),
-                    )
-                    FileOutputStream(file).use { it.write(bytes) }
-                    mainHandler.post {
-                        Toast.makeText(this@NativeWebViewActivity, "已保存: ${file.name}", Toast.LENGTH_SHORT).show()
-                    }
+                    saveBytesToPublicDownloads(bytes, name, mime)
                 }.onFailure {
                     mainHandler.post {
                         Toast.makeText(this@NativeWebViewActivity, "保存失败: ${it.message}", Toast.LENGTH_SHORT).show()
