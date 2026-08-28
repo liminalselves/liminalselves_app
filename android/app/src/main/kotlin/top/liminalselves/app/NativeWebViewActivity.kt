@@ -38,9 +38,10 @@ import android.webkit.MimeTypeMap
 import android.webkit.PermissionRequest
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
+import android.webkit.WebBackForwardList
 import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
 import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebView
@@ -113,6 +114,9 @@ class NativeWebViewActivity : ComponentActivity() {
 
     /** 无 WebView 历史可退时：首次返回仅提示，短时内第二次返回才 [finish]。 */
     private var lastExitBackPressElapsed = 0L
+
+    /** 后台期间保存的 WebView 导航历史：renderer 被系统回收重建时恢复返回栈。 */
+    private var savedWebViewState: Bundle? = null
     private val topPullHotZoneDp = 84
     // 壳层采用 Flutter 风格蓝色系；仅作用于加载与下拉反馈，不改变站内导航逻辑。
     private val defaultChromeColor = Color.parseColor("#F7F9F5")
@@ -258,9 +262,15 @@ class NativeWebViewActivity : ComponentActivity() {
                 ).show()
             }
         })
+        // 系统回收/旋转重建 Activity 时 WebView 历史不会自动恢复，
+        // 优先从实例状态恢复导航历史，避免返回键/站内返回按钮失效。
         val url = resolveLaunchUrl(intent)
         currentUrl = url
-        loadUrl(url)
+        if (restoreWebViewHistory(savedInstanceState)) {
+            webView.reload()
+        } else {
+            loadUrl(url)
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -407,6 +417,7 @@ class NativeWebViewActivity : ComponentActivity() {
                 reconcileStartupNotificationPermission()
                 injectNativePushStateFromPrefs()
                 onPageReadyForPushRestore()
+                snapshotWebViewHistory()
             }
 
             override fun onReceivedError(
@@ -855,7 +866,55 @@ class NativeWebViewActivity : ComponentActivity() {
     private fun recreateWebViewAndReload() {
         setupViews()
         setupWebView()
-        loadUrl(currentUrl)
+        // renderer 被系统回收：优先恢复后台时保存的历史栈（返回键/站内返回才有效），
+        // 无可用历史时回退到直接加载当前 URL。
+        if (restoreWebViewHistory(savedWebViewState)) {
+            webView.reload()
+        } else {
+            loadUrl(currentUrl)
+        }
+    }
+
+    /**
+     * 保存当前 WebView 导航历史到内存：后台期间 renderer 可能被系统回收，
+     * WebView 重建后靠 [restoreWebViewHistory] 恢复返回栈，
+     * 避免"明明不在首页却提示再次点击返回键退出"。
+     */
+    private fun snapshotWebViewHistory() {
+        if (isFinishing || !::webView.isInitialized) return
+        savedWebViewState = null
+        if (webView.copyBackForwardList().size <= 1) return
+        val bundle = Bundle()
+        if (invokeWebViewStateMethod("saveState", bundle) != null) {
+            savedWebViewState = bundle
+        }
+    }
+
+    /** 从 [state] 恢复 WebView 导航历史；至少恢复出可退条目才视为成功。 */
+    private fun restoreWebViewHistory(state: Bundle?): Boolean {
+        if (state == null || !::webView.isInitialized) return false
+        val result = invokeWebViewStateMethod("restoreState", state)
+        val restoredCount = when (result) {
+            is Int -> result
+            is WebBackForwardList -> result.size
+            else -> 0
+        }
+        return restoredCount > 1
+    }
+
+    /**
+     * 反射调用 WebView.saveState/restoreState：API 35+ 返回 WebBackForwardList，
+     * 旧版本返回 int，直接编译调用会因方法描述符（返回类型）不一致在旧设备抛
+     * NoSuchMethodError，故统一经反射调用并按实际返回类型解释。
+     */
+    private fun invokeWebViewStateMethod(name: String, bundle: Bundle): Any? {
+        return try {
+            WebView::class.java
+                .getMethod(name, Bundle::class.java)
+                .invoke(webView, bundle)
+        } catch (t: Throwable) {
+            null
+        }
     }
 
     private fun updateChromeColorFromWebPage() {
@@ -1921,8 +1980,20 @@ class NativeWebViewActivity : ComponentActivity() {
         if (isFinishing) {
             stopNativePushAll()
         }
+        // 保存导航历史（须在 renderer 仍存活时）：后台期间 renderer 可能被系统回收，
+        // 重建 WebView 后靠它恢复返回栈（系统返回键与站内返回按钮才有效）。
+        if (!isFinishing) {
+            snapshotWebViewHistory()
+        }
         webView.onPause()
         super.onPause()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // WebView 不会随 Activity 重建自动恢复历史；把已保存的历史并入实例状态，
+        // 覆盖旋转/系统回收重建场景（进程被杀时由 [savedWebViewState] 兜底）。
+        savedWebViewState?.let { outState.putAll(it) }
     }
 
     override fun onResume() {
