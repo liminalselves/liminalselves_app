@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -49,6 +50,17 @@ import androidx.core.view.WindowInsetsCompat
  */
 class PermissionSetupActivity : ComponentActivity() {
 
+    /** 向导页调色板：跟随站内深浅（[EXTRA_DARK] 由 NativeWebViewActivity 传入）。 */
+    private data class WizardPalette(
+        val bg: String,
+        val title: String,
+        val body: String,
+        val track: String,
+        val secondaryBg: String,
+        val accentText: String,
+        val error: String,
+    )
+
     companion object {
         private const val STEP_NOTIFICATION = 0
         private const val STEP_BATTERY = 1
@@ -57,16 +69,32 @@ class PermissionSetupActivity : ComponentActivity() {
         private const val STEP_CHANNEL_KEEPALIVE = 4
         private const val TOTAL_STEPS = 5
 
-        // 与 NativeWebViewActivity 壳层一致的配色
-        private const val BG_COLOR = "#F7F9F5"
+        /** 站内（Misskey 当前生效主题）是否深色；未携带时回退系统深浅。 */
+        const val EXTRA_DARK = "extra_dark"
+
+        // 与 NativeWebViewActivity 壳层一致的配色；主按钮实心蓝两套通用。
         private const val ACCENT = "#1A73E8"
-        private const val ACCENT_DARK = "#1557B0"
-        private const val TITLE_COLOR = "#162033"
-        private const val BODY_COLOR = "#637083"
-        private const val PROGRESS_TRACK = "#E6EBF0"
-        private const val SECONDARY_BG = "#EAF2FF"
-        private const val ERROR_COLOR = "#D93025"
+        private val LIGHT_PALETTE = WizardPalette(
+            bg = "#F7F9F5",
+            title = "#162033",
+            body = "#637083",
+            track = "#E6EBF0",
+            secondaryBg = "#EAF2FF",
+            accentText = "#1557B0",
+            error = "#D93025",
+        )
+        private val DARK_PALETTE = WizardPalette(
+            bg = "#15171C",
+            title = "#E8EBF2",
+            body = "#A6AEBE",
+            track = "#262B34",
+            secondaryBg = "#1E2A3D",
+            accentText = "#8AB4F8",
+            error = "#F28B82",
+        )
     }
+
+    private lateinit var palette: WizardPalette
 
     private lateinit var stepBadge: TextView
     private lateinit var progressTrack: FrameLayout
@@ -114,13 +142,20 @@ class PermissionSetupActivity : ComponentActivity() {
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // 跟随站内（Misskey 当前生效主题）深浅；未携带 extra 时回退系统深浅。
+        // setTheme 必须在 super.onCreate / setContentView 之前调用才能作用于窗口。
+        val dark = intent.getBooleanExtra(EXTRA_DARK, isSystemNightMode())
+        if (dark) {
+            setTheme(R.style.Theme_Liminal_Wizard_Dark)
+        }
+        palette = if (dark) DARK_PALETTE else LIGHT_PALETTE
         super.onCreate(savedInstanceState)
-        // 系统栏配色由专用主题 Theme.Liminal.Wizard 声明（透明栏 + 浅色图标），
-        // 此处仅确保 edge-to-edge 下图标外观为深色；窗口内边距由 buildUi 中的 insets 监听消费。
+        // 系统栏配色由专用主题声明（透明栏），此处仅按深浅设置图标外观；
+        // 窗口内边距由 buildUi 中的 insets 监听消费。
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowCompat.getInsetsController(window, window.decorView).apply {
-            isAppearanceLightStatusBars = true
-            isAppearanceLightNavigationBars = true
+            isAppearanceLightStatusBars = !dark
+            isAppearanceLightNavigationBars = !dark
         }
         // 先确保全部渠道已创建，后续才能检查各渠道的开关状态
         NativeWebViewActivity.ensureMisskeyChannels(this)
@@ -399,7 +434,7 @@ class PermissionSetupActivity : ComponentActivity() {
 
     private fun buildUi(): FrameLayout {
         val root = FrameLayout(this).apply {
-            setBackgroundColor(Color.parseColor(BG_COLOR))
+            setBackgroundColor(Color.parseColor(palette.bg))
         }
         // 系统栏适配：消费状态栏/导航栏 insets 作为内边距，避免内容被遮挡（edge-to-edge）
         ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
@@ -420,14 +455,14 @@ class PermissionSetupActivity : ComponentActivity() {
                 text = "开启推送"
                 textSize = 13f
                 typeface = Typeface.DEFAULT_BOLD
-                setTextColor(Color.parseColor(BODY_COLOR))
+                setTextColor(Color.parseColor(palette.body))
             },
             LinearLayout.LayoutParams(-2, -2),
         )
 
         // 进度条：圆角轨道 + 动画填充
         progressTrack = FrameLayout(this).apply {
-            background = roundedRect(Color.parseColor(PROGRESS_TRACK), dp(6), Color.TRANSPARENT, 0)
+            background = roundedRect(Color.parseColor(palette.track), dp(6), Color.TRANSPARENT, 0)
         }
         progressFill = View(this).apply {
             background = roundedRect(Color.parseColor(ACCENT), dp(6), Color.TRANSPARENT, 0)
@@ -451,28 +486,28 @@ class PermissionSetupActivity : ComponentActivity() {
             gravity = Gravity.CENTER
             textSize = 22f
             typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.parseColor(ACCENT))
-            background = roundedRect(Color.parseColor(SECONDARY_BG), dp(18), Color.TRANSPARENT, 0)
+            setTextColor(Color.parseColor(palette.accentText))
+            background = roundedRect(Color.parseColor(palette.secondaryBg), dp(18), Color.TRANSPARENT, 0)
         }
         contentBlock.addView(stepBadge, LinearLayout.LayoutParams(dp(60), dp(60)))
         stepTitle = TextView(this).apply {
             gravity = Gravity.CENTER
             textSize = 24f
             typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.parseColor(TITLE_COLOR))
+            setTextColor(Color.parseColor(palette.title))
         }
         contentBlock.addView(stepTitle, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(22) })
         stepDesc = TextView(this).apply {
             gravity = Gravity.CENTER
             textSize = 15f
-            setTextColor(Color.parseColor(BODY_COLOR))
+            setTextColor(Color.parseColor(palette.body))
             setLineSpacing(0f, 1.3f)
         }
         contentBlock.addView(stepDesc, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
         hintText = TextView(this).apply {
             gravity = Gravity.CENTER
             textSize = 13f
-            setTextColor(Color.parseColor(ERROR_COLOR))
+            setTextColor(Color.parseColor(palette.error))
             setLineSpacing(0f, 1.2f)
             visibility = View.GONE
         }
@@ -507,15 +542,20 @@ class PermissionSetupActivity : ComponentActivity() {
         val bg = if (primary) {
             roundedRect(Color.parseColor(ACCENT), dp(12), Color.parseColor(ACCENT), 0)
         } else {
-            roundedRect(Color.parseColor(SECONDARY_BG), dp(12), Color.TRANSPARENT, 0)
+            roundedRect(Color.parseColor(palette.secondaryBg), dp(12), Color.TRANSPARENT, 0)
         }
-        val rippleColor = if (primary) Color.parseColor(ACCENT_DARK) else Color.parseColor(ACCENT)
+        // 涟漪：浅色下取更深的蓝、深色下取更亮的蓝，保证与底色有对比。
+        val rippleColor = if (primary) {
+            Color.parseColor(palette.accentText)
+        } else {
+            Color.parseColor(ACCENT)
+        }
         return Button(this).apply {
             text = label
             textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
             isAllCaps = false
-            setTextColor(if (primary) Color.WHITE else Color.parseColor(ACCENT_DARK))
+            setTextColor(if (primary) Color.WHITE else Color.parseColor(palette.accentText))
             background = RippleDrawable(ColorStateList.valueOf(rippleColor), bg, null)
             setOnClickListener { onClick() }
         }
@@ -538,4 +578,9 @@ class PermissionSetupActivity : ComponentActivity() {
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt().coerceAtLeast(1)
+
+    /** 系统是否处于深色模式；仅作 EXTRA_DARK 缺失时的兜底。 */
+    private fun isSystemNightMode(): Boolean =
+        (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
 }

@@ -14,6 +14,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
@@ -86,6 +87,10 @@ class NativeWebViewActivity : ComponentActivity() {
     private lateinit var webView: WebView
     private lateinit var progressBar: ProgressBar
     private lateinit var errorOverlay: View
+
+    /** 错误页当前构建所用的深浅（与 [pageThemeDark] 不一致时在下次展示前重建）。 */
+    private var errorOverlayDark = false
+    private lateinit var contentFrame: FrameLayout
     private lateinit var errorUrlText: TextView
     private lateinit var errorMetaText: TextView
     private val defaultUrl = BuildConfig.MISSKEY_URL.ifBlank {
@@ -121,14 +126,27 @@ class NativeWebViewActivity : ComponentActivity() {
     private var savedWebViewState: Bundle? = null
     private val topPullHotZoneDp = 84
     // 壳层采用 Flutter 风格蓝色系；仅作用于加载与下拉反馈，不改变站内导航逻辑。
-    private val defaultChromeColor = Color.parseColor("#F7F9F5")
+    private val lightChromeColor = Color.parseColor("#F7F9F5")
+    private val darkChromeColor = Color.parseColor("#15171C")
+
+    /** 兜底壳色（页面未上报/加载失败）：跟随当前已知的站内深浅状态。 */
+    private val defaultChromeColor: Int
+        get() = if (pageThemeDark) darkChromeColor else lightChromeColor
     private val accentColor = Color.parseColor("#1A73E8")
     private val accentColorDark = Color.parseColor("#1557B0")
     private val accentTrackColor = Color.parseColor("#D6E4FF")
     // 顶部加载条与下拉刷新均使用蓝色系。
     private val progressBarColor = Color.parseColor("#1A73E8")
     private val progressBarTrackColor = Color.parseColor("#D6E4FF")
-    private var lastChromeColor: Int = defaultChromeColor
+    private var lastChromeColor = lightChromeColor
+
+    /**
+     * Misskey 当前生效主题是否为深色：由网页上报的背景色亮度推导
+     * （installChromeColorSyncBridge 实时同步，含站内手动切换主题），
+     * 页面未上报前以系统深浅兜底。壳层对话框/错误页/下拉刷新等据此跟随站内深浅，
+     * 而非跟随系统——站内「跟随设备」或手动选择都收敛到同一表现。
+     */
+    private var pageThemeDark = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private var lastSystemBarAppliedColor: Int? = null
     private var lastSystemBarAppliedLightBars: Boolean? = null
@@ -235,6 +253,10 @@ class NativeWebViewActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 站内深浅初始值：尚无网页上报，先按系统深浅兜底（msk 默认「跟随设备」），
+        // 页面就绪后由 AppChrome 上报的背景色纠正（含用户在站内手动切换的主题）。
+        pageThemeDark = isSystemNightMode()
+        lastChromeColor = defaultChromeColor
         overridePendingTransition(0, 0)
         setupSystemBars()
         applyWindowRefreshPresentationHints()
@@ -390,7 +412,15 @@ class NativeWebViewActivity : ComponentActivity() {
             webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, true)
         }
         webView.overScrollMode = WebView.OVER_SCROLL_IF_CONTENT_SCROLLS
-        webView.setBackgroundColor(getColor(android.R.color.background_light))
+        // 深色模式下底色同步压黑：避免站点应用深色主题前的白屏闪变
+        // （Chromium 对「主题偏好深色且未设底色」的默认同样取黑）。
+        webView.setBackgroundColor(
+            if (isSystemNightMode()) {
+                getColor(android.R.color.background_dark)
+            } else {
+                getColor(android.R.color.background_light)
+            },
+        )
         // 避免 WebView 自行对 status bar inset 做额外 padding，造成顶端出现留白条。
         ViewCompat.setOnApplyWindowInsetsListener(webView) { v, insets ->
             v.setPadding(0, 0, 0, 0)
@@ -555,7 +585,11 @@ class NativeWebViewActivity : ComponentActivity() {
     }
 
     private fun setupViews() {
-        webView = WebView(this)
+        // prefers-color-scheme 跟随系统：必须用 DayNight 主题的 Context 创建 WebView
+        // （Chromium 从该 Context 主题的 isLightTheme 推导深浅色），Activity 本身的
+        // Theme.Light 保持壳层浅色不变。系统深浅色切换会触发 Activity 重建，
+        // 届时以新配置重新解析该主题，站内 matchMedia 即得到正确结果。
+        webView = WebView(ContextThemeWrapper(this, R.style.Theme_Liminal_WebView))
         swipeRefresh = TopEdgeSwipeRefreshLayout(this).apply {
             hotZonePx = dp(topPullHotZoneDp)
             statusBarInsetProvider = {
@@ -565,9 +599,9 @@ class NativeWebViewActivity : ComponentActivity() {
             }
             canChildScrollUpProvider = { webView.canScrollVertically(-1) }
             isEnabled = true
-            // 下拉刷新旋转指示器：统一品牌色，避免默认黄/蓝。
+            // 下拉刷新旋转指示器：统一品牌色，避免默认黄/蓝；
+            // 指示器圆底色由 applyShellPalette 按站内深浅设置。
             setColorSchemeColors(accentColor, accentColorDark)
-            setProgressBackgroundColorSchemeColor(Color.WHITE)
             // 只下移刷新指示器位置，保持当前触发/回弹手感不变。
             setProgressViewOffset(false, dp(18), dp(62))
             setOnRefreshListener {
@@ -594,6 +628,7 @@ class NativeWebViewActivity : ComponentActivity() {
             insets
         }
         val frame = FrameLayout(this)
+        contentFrame = frame
         progressBar = ProgressBar(
             this,
             null,
@@ -602,7 +637,6 @@ class NativeWebViewActivity : ComponentActivity() {
             max = 100
             visibility = View.GONE
             progressTintList = ColorStateList.valueOf(progressBarColor)
-            progressBackgroundTintList = ColorStateList.valueOf(progressBarTrackColor)
         }
         frame.addView(
             webView,
@@ -618,7 +652,8 @@ class NativeWebViewActivity : ComponentActivity() {
                 dp(2),
             ),
         )
-        errorOverlay = buildErrorOverlay()
+        errorOverlayDark = pageThemeDark
+        errorOverlay = buildErrorOverlay(pageThemeDark)
         frame.addView(
             errorOverlay,
             FrameLayout.LayoutParams(
@@ -633,12 +668,63 @@ class NativeWebViewActivity : ComponentActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
             ),
         )
+        applyShellPalette()
         setContentView(swipeRefresh)
     }
 
-    private fun buildErrorOverlay(): View {
+    /** 壳层随站内深浅变化的调色板应用：下拉刷新指示器圆底 + 加载条轨道。 */
+    private fun applyShellPalette() {
+        swipeRefresh.setProgressBackgroundColorSchemeColor(
+            if (pageThemeDark) Color.parseColor("#22262E") else Color.WHITE,
+        )
+        progressBar.progressBackgroundTintList = ColorStateList.valueOf(
+            if (pageThemeDark) Color.parseColor("#1F3A66") else progressBarTrackColor,
+        )
+    }
+
+    /** 错误页调色板：跟随站内深浅（[buildErrorOverlay] 按当前 [pageThemeDark] 选择）。 */
+    private data class ErrorPalette(
+        val title: Int,
+        val body: Int,
+        val cardBg: Int,
+        val cardStroke: Int,
+        val cardText: Int,
+        val meta: Int,
+        val markAccent: Int,
+        val secondaryBg: Int,
+        val secondaryText: Int,
+    )
+
+    private fun errorPalette(dark: Boolean): ErrorPalette = if (dark) {
+        ErrorPalette(
+            title = Color.parseColor("#E8EBF2"),
+            body = Color.parseColor("#A6AEBE"),
+            cardBg = Color.parseColor("#1F232B"),
+            cardStroke = Color.parseColor("#303643"),
+            cardText = Color.parseColor("#C5CBD8"),
+            meta = Color.parseColor("#7C8496"),
+            markAccent = Color.parseColor("#8AB4F8"),
+            secondaryBg = Color.parseColor("#1E2A3D"),
+            secondaryText = Color.parseColor("#8AB4F8"),
+        )
+    } else {
+        ErrorPalette(
+            title = Color.parseColor("#162033"),
+            body = Color.parseColor("#637083"),
+            cardBg = Color.WHITE,
+            cardStroke = Color.parseColor("#E5EAF1"),
+            cardText = Color.parseColor("#405064"),
+            meta = Color.parseColor("#8A95A6"),
+            markAccent = accentColor,
+            secondaryBg = Color.parseColor("#EAF2FF"),
+            secondaryText = accentColorDark,
+        )
+    }
+
+    private fun buildErrorOverlay(dark: Boolean): View {
+        val palette = errorPalette(dark)
         val root = FrameLayout(this).apply {
-            setBackgroundColor(defaultChromeColor)
+            setBackgroundColor(if (dark) darkChromeColor else lightChromeColor)
             visibility = View.GONE
             isClickable = true
             isFocusable = true
@@ -655,8 +741,8 @@ class NativeWebViewActivity : ComponentActivity() {
             gravity = Gravity.CENTER
             textSize = 30f
             typeface = Typeface.DEFAULT_BOLD
-            setTextColor(accentColor)
-            background = roundedRect(Color.WHITE, dp(28), Color.parseColor("#E5EAF1"), 1)
+            setTextColor(palette.markAccent)
+            background = roundedRect(palette.cardBg, dp(28), palette.cardStroke, 1)
         }
         content.addView(
             mark,
@@ -671,7 +757,7 @@ class NativeWebViewActivity : ComponentActivity() {
                 gravity = Gravity.CENTER
                 textSize = 24f
                 typeface = Typeface.DEFAULT_BOLD
-                setTextColor(Color.parseColor("#162033"))
+                setTextColor(palette.title)
             },
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -684,7 +770,7 @@ class NativeWebViewActivity : ComponentActivity() {
                 text = "页面没有成功加载。请检查网络状态，或稍后重试。"
                 gravity = Gravity.CENTER
                 textSize = 15f
-                setTextColor(Color.parseColor("#637083"))
+                setTextColor(palette.body)
                 setLineSpacing(0f, 1.18f)
             },
             LinearLayout.LayoutParams(
@@ -697,10 +783,10 @@ class NativeWebViewActivity : ComponentActivity() {
 
         errorUrlText = TextView(this).apply {
             textSize = 13f
-            setTextColor(Color.parseColor("#405064"))
+            setTextColor(palette.cardText)
             setLineSpacing(0f, 1.12f)
             setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = roundedRect(Color.WHITE, dp(8), Color.parseColor("#E5EAF1"), 1)
+            background = roundedRect(palette.cardBg, dp(8), palette.cardStroke, 1)
         }
         content.addView(
             errorUrlText,
@@ -715,7 +801,7 @@ class NativeWebViewActivity : ComponentActivity() {
         errorMetaText = TextView(this).apply {
             gravity = Gravity.CENTER
             textSize = 12f
-            setTextColor(Color.parseColor("#8A95A6"))
+            setTextColor(palette.meta)
         }
         content.addView(
             errorMetaText,
@@ -732,7 +818,7 @@ class NativeWebViewActivity : ComponentActivity() {
             gravity = Gravity.CENTER
         }
         actions.addView(
-            makeErrorButton("浏览器打开", primary = false) {
+            makeErrorButton("浏览器打开", primary = false, palette = palette) {
                 runCatching { openExternal(Uri.parse(currentUrl)) }
             },
             LinearLayout.LayoutParams(0, dp(46), 1f).apply {
@@ -740,7 +826,7 @@ class NativeWebViewActivity : ComponentActivity() {
             },
         )
         actions.addView(
-            makeErrorButton("重试", primary = true) { retryFromErrorPage() },
+            makeErrorButton("重试", primary = true, palette = palette) { retryFromErrorPage() },
             LinearLayout.LayoutParams(0, dp(46), 1f).apply {
                 marginStart = dp(5)
             },
@@ -766,17 +852,22 @@ class NativeWebViewActivity : ComponentActivity() {
         return root
     }
 
-    private fun makeErrorButton(label: String, primary: Boolean, onClick: () -> Unit): Button {
+    private fun makeErrorButton(
+        label: String,
+        primary: Boolean,
+        palette: ErrorPalette,
+        onClick: () -> Unit,
+    ): Button {
         return Button(this).apply {
             text = label
             textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
             isAllCaps = false
-            setTextColor(if (primary) Color.WHITE else accentColorDark)
+            setTextColor(if (primary) Color.WHITE else palette.secondaryText)
             background = if (primary) {
                 roundedRect(accentColor, dp(8), accentColor, 0)
             } else {
-                roundedRect(Color.parseColor("#EAF2FF"), dp(8), Color.TRANSPARENT, 0)
+                roundedRect(palette.secondaryBg, dp(8), Color.TRANSPARENT, 0)
             }
             setOnClickListener { onClick() }
         }
@@ -958,6 +1049,12 @@ class NativeWebViewActivity : ComponentActivity() {
     }
 
     private fun applyChromeColorNow(color: Int) {
+        // 由页面背景亮度推导站内深浅：壳层对话框/错误页/下拉刷新等据此跟随
+        // Misskey 实际生效的主题（站内切换主题会触发 AppChrome 上报，实时联动）。
+        if (!isLightColor(color) != pageThemeDark) {
+            pageThemeDark = !isLightColor(color)
+            applyShellPalette()
+        }
         if (color == lastChromeColor) return
         swipeRefresh.setBackgroundColor(color)
         applySystemBarColor(color)
@@ -1060,6 +1157,14 @@ class NativeWebViewActivity : ComponentActivity() {
             }.getOrNull()
     }
 
+    /** 对话框宿主主题：亮/暗跟随 Misskey 当前生效主题（而非系统）。 */
+    private fun dialogHostStyle(): Int =
+        if (pageThemeDark) {
+            R.style.Theme_Liminal_Dialog_Host_Dark
+        } else {
+            R.style.Theme_Liminal_Dialog_Host_Light
+        }
+
     private fun handleNavigation(uri: Uri): Boolean {
         val scheme = uri.scheme?.lowercase() ?: return false
         if (scheme in setOf("javascript", "about", "blob", "data")) return false
@@ -1073,7 +1178,7 @@ class NativeWebViewActivity : ComponentActivity() {
         }
         // ContextThemeWrapper 给对话框一个完整的 Material 3 Theme，
         // 隔离 Activity 原有主题，避免 MaterialAlertDialogBuilder 找不到 Material 属性而崩溃。
-        val dialogCtx = ContextThemeWrapper(this, R.style.Theme_Liminal_Dialog_Host)
+        val dialogCtx = ContextThemeWrapper(this, dialogHostStyle())
         MaterialAlertDialogBuilder(dialogCtx)
             .setTitle("即将离开站点")
             .setMessage("当前链接不在 liminalselves.top 域内，将在系统默认浏览器中打开：\n\n${uri}")
@@ -1097,7 +1202,7 @@ class NativeWebViewActivity : ComponentActivity() {
             return
         }
         // 站外域名：弹确认后在系统浏览器打开
-        val dialogCtx = ContextThemeWrapper(this, R.style.Theme_Liminal_Dialog_Host)
+        val dialogCtx = ContextThemeWrapper(this, dialogHostStyle())
         MaterialAlertDialogBuilder(dialogCtx)
             .setTitle("即将离开站点")
             .setMessage("当前链接不在 liminalselves.top 域内，将在系统默认浏览器中打开：\n\n${rawUrl}")
@@ -1130,6 +1235,19 @@ class NativeWebViewActivity : ComponentActivity() {
         webView.visibility = View.INVISIBLE
         applySystemBarColor(defaultChromeColor)
         if (::errorOverlay.isInitialized) {
+            // 站内深浅在错误页构建后变化过：按当前状态重建，保证错误页与站内主题一致。
+            if (errorOverlayDark != pageThemeDark) {
+                errorOverlayDark = pageThemeDark
+                contentFrame.removeView(errorOverlay)
+                errorOverlay = buildErrorOverlay(pageThemeDark)
+                contentFrame.addView(
+                    errorOverlay,
+                    FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                    ),
+                )
+            }
             errorUrlText.text = failingUrl
             errorMetaText.text = formatLoadError(code, description)
             errorOverlay.visibility = View.VISIBLE
@@ -1666,7 +1784,11 @@ class NativeWebViewActivity : ComponentActivity() {
     private fun enableNativePushFromBridge() {
         if (pushSetupRunning) return
         pushSetupRunning = true
-        pushSetupLauncher.launch(Intent(this, PermissionSetupActivity::class.java))
+        // 向导页配色跟随站内深浅（而非系统），与当前 Misskey 主题一致。
+        pushSetupLauncher.launch(
+            Intent(this, PermissionSetupActivity::class.java)
+                .putExtra(PermissionSetupActivity.EXTRA_DARK, pageThemeDark),
+        )
     }
 
     /** 是否正在运行权限向导，避免重复拉起。 */
@@ -2081,6 +2203,11 @@ class NativeWebViewActivity : ComponentActivity() {
     private fun getPrefs() = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt().coerceAtLeast(1)
+
+    /** 系统是否处于深色模式（跟随 uiMode 配置；切换会触发 Activity 重建后重新求值）。 */
+    private fun isSystemNightMode(): Boolean =
+        (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
 
     override fun onPause() {
         mainHandler.removeCallbacks(refreshChromeColorRunnable)
