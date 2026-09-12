@@ -268,10 +268,12 @@ class NativeWebViewActivity : ComponentActivity() {
         applyPersistentSystemBars()
         setupViews()
         setupWebView()
-        registerReceiver(
+        // RECEIVER_NOT_EXPORTED 的带 flags 重载为 API 26+，API 24/25 需经 ContextCompat 兼容分发
+        ContextCompat.registerReceiver(
+            this,
             downloadCompleteReceiver,
             IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
-            Context.RECEIVER_NOT_EXPORTED,
+            ContextCompat.RECEIVER_NOT_EXPORTED,
         )
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
