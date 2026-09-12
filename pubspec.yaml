@@ -112,12 +112,19 @@ flutter_launcher_icons:
   image_path: branding/logo.jpg
 
 # 原生启动屏（首帧前）：执行 `dart run flutter_native_splash:create`
+# 深浅两套：浅色白底深 logo；深色 #15171C 底浅 logo（与壳层 darkChromeColor 一致）。
+# *_dark.png 源图由对应浅色源图按亮度重映射生成（深底 #15171C / 浅笔画 #E8EBF2），
+# 更换 logo 时需同步重生成，否则重新 create 会把夜间开屏打回白屏。
 flutter_native_splash:
   color: "#FFFFFF"
+  color_dark: "#15171C"
   image: branding/splash_logo.png
+  image_dark: branding/splash_logo_dark.png
   android_gravity: center
   ios_content_mode: center
   web: false
   android_12:
     color: "#FFFFFF"
+    color_dark: "#15171C"
     image: branding/android12_splash_logo.png
+    image_dark: branding/android12_splash_logo_dark.png

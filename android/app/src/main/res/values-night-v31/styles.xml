@@ -6,16 +6,19 @@
         <item name="android:forceDarkAllowed">false</item>
         <item name="android:windowFullscreen">false</item>
         <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <!-- 夜间系统开屏（Android 12+）：背景色与图标自动取夜间资源
+             （@color/splash_background / drawable-night-* 的 android12splash 深色版） -->
         <item name="android:windowDrawsSystemBarBackgrounds">true</item>
         <item name="android:statusBarColor">@color/splash_background</item>
         <item name="android:navigationBarColor">@color/splash_background</item>
-        <item name="android:windowLightStatusBar">true</item>
-        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
         <item name="android:windowSplashScreenBackground">@color/splash_background</item>
         <item name="android:windowSplashScreenAnimatedIcon">@drawable/android12splash</item>
     </style>
     <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
-        <item name="android:windowBackground">?android:colorBackground</item>
+        <!-- 同 values-night/styles.xml：夜间兜底窗口背景取深色，避免首帧前白屏 -->
+        <item name="android:windowBackground">@color/splash_background</item>
     </style>
 
     <!-- 权限向导页专用主题（Android 12+ 深色模式）：仍保持浅色，与主页壳层一致 -->

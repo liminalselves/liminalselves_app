@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 夜间开屏/启动窗背景：与壳层深色底（darkChromeColor #15171C）一致，
+         避免夜间启动时白屏闪光。logo 深色版见 drawable-night-*。 -->
+    <color name="splash_background">#15171C</color>
+</resources>
