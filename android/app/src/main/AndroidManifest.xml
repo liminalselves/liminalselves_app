@@ -59,11 +59,14 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- WebView 主壳：旋转/键盘等配置变化自行消化不重建（视频全屏转屏不中断、页面不重载）；
+             刻意不含 uiMode——系统深浅色切换仍需重建 Activity 以刷新 WebView 主题与壳层联动。 -->
         <activity
             android:name=".NativeWebViewActivity"
             android:exported="false"
             android:launchMode="singleTop"
             android:theme="@style/NormalTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|locale|layoutDirection|fontScale|density"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize" />
         <!-- 推送权限设置向导：逐项引导开启通知/电池豁免/悬浮通知。

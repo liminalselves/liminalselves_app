@@ -125,6 +125,11 @@ class NativeWebViewActivity : ComponentActivity() {
     /** 后台期间保存的 WebView 导航历史：renderer 被系统回收重建时恢复返回栈。 */
     private var savedWebViewState: Bundle? = null
     private val topPullHotZoneDp = 84
+
+    // ─── HTML5 全屏（视频等 Fullscreen API → WebChromeClient.onShowCustomView）───
+    /** 当前处于全屏的 WebView 自定义视图（如私信视频点全屏时由引擎提供）。 */
+    private var fullscreenCustomView: View? = null
+    private var fullscreenCustomViewCallback: WebChromeClient.CustomViewCallback? = null
     // 壳层采用 Flutter 风格蓝色系；仅作用于加载与下拉反馈，不改变站内导航逻辑。
     private val lightChromeColor = Color.parseColor("#F7F9F5")
     private val darkChromeColor = Color.parseColor("#15171C")
@@ -270,6 +275,8 @@ class NativeWebViewActivity : ComponentActivity() {
         )
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
+                // 视频等 HTML5 全屏时，返回键先退出全屏而非退出页面
+                if (exitFullscreenCustomViewIfActive()) return
                 // 实时从 WebView 引擎获取当前 URL，避免 SPA pushState 后 currentUrl 滞后
                 val actualUrl = webView.url ?: currentUrl
                 val path = Uri.parse(actualUrl).path.orEmpty()
@@ -390,6 +397,59 @@ class NativeWebViewActivity : ComponentActivity() {
     private fun applyPersistentSystemBars() {
         val controller = WindowCompat.getInsetsController(window, window.decorView) ?: return
         controller.show(WindowInsetsCompat.Type.systemBars())
+    }
+
+    // ─── HTML5 全屏（视频等 Fullscreen API）─────────────────────────────────
+
+    /** 进入 HTML5 全屏：把 WebView 提供的视图加到 DecorView 铺满全屏并隐藏系统栏。 */
+    private fun showFullscreenCustomView(view: View, callback: WebChromeClient.CustomViewCallback) {
+        if (fullscreenCustomView === view) return
+        if (fullscreenCustomView != null) {
+            // 已有全屏视图未退出：按约定丢弃本次回调，避免叠层
+            runCatching { callback.onCustomViewHidden() }
+            return
+        }
+        fullscreenCustomView = view
+        fullscreenCustomViewCallback = callback
+        // 视频全屏期间保持屏幕常亮
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // 加到 DecorView（而非 contentFrame：后者在 swipeRefresh 内会被 insets padding 缩进，
+        // 加到 DecorView 才能真正覆盖状态栏/导航栏区域）。
+        (window.decorView as ViewGroup).addView(
+            view,
+            ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        // 沉浸式隐藏系统栏；从屏幕边缘滑动以瞬时浮层临时唤出
+        WindowCompat.getInsetsController(window, view).apply {
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            hide(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    /** 退出 HTML5 全屏：移除全屏视图，恢复系统栏与常规壳层。 */
+    private fun hideFullscreenCustomView() {
+        val view = fullscreenCustomView ?: return
+        fullscreenCustomView = null
+        fullscreenCustomViewCallback = null
+        (view.parent as? ViewGroup)?.removeView(view)
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        applyPersistentSystemBars()
+        applySystemBarColor(lastChromeColor)
+    }
+
+    /**
+     * 返回键等**主动**退出全屏：清理视图后调用回调通知 WebView（同步 DOM 全屏状态）；
+     * WebView 主动调 onHideCustomView 的路径不再回调，避免循环。返回是否消费了本次返回。
+     */
+    private fun exitFullscreenCustomViewIfActive(): Boolean {
+        if (fullscreenCustomView == null) return false
+        val callback = fullscreenCustomViewCallback
+        hideFullscreenCustomView()
+        callback?.let { runCatching { it.onCustomViewHidden() } }
+        return true
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -577,6 +637,27 @@ class NativeWebViewActivity : ComponentActivity() {
                 this@NativeWebViewActivity.filePathCallback = filePathCallback
                 launchFileChooser(fileChooserParams)
                 return true
+            }
+
+            // HTML5 全屏（Fullscreen API）：视频全屏按钮等场景，把引擎给出的视图铺满窗口。
+            // 不实现这两个回调时 requestFullscreen() 会静默失败（浏览器正常、WebView 无反应）。
+            override fun onShowCustomView(view: View?, callback: WebChromeClient.CustomViewCallback?) {
+                if (view == null || callback == null) return
+                showFullscreenCustomView(view, callback)
+            }
+
+            // 个别 ROM/旧引擎会走带方向参数的重载，行为保持一致。
+            override fun onShowCustomView(
+                view: View?,
+                requestedOrientation: Int,
+                callback: WebChromeClient.CustomViewCallback?,
+            ) {
+                if (view == null || callback == null) return
+                showFullscreenCustomView(view, callback)
+            }
+
+            override fun onHideCustomView() {
+                hideFullscreenCustomView()
             }
         }
         webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
@@ -2346,6 +2427,8 @@ class NativeWebViewActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        // 全屏视图仍挂着时先退出，避免 DecorView 泄漏与回调悬挂
+        exitFullscreenCustomViewIfActive()
         mainHandler.removeCallbacks(refreshChromeColorRunnable)
         mainHandler.removeCallbacks(applyPendingChromeColorRunnable)
         // 常驻模式：仅 Activity finish（用户退出 App）时停止推送；
