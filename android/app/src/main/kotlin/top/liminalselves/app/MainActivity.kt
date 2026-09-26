@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.view.ContextThemeWrapper
 import android.view.Gravity
@@ -165,24 +166,51 @@ class MainActivity : ComponentActivity() {
                 .orEmpty()
                 .substringBefore('+')
                 .ifBlank { "0.0.0" }
-            val minimum = nativeInfo.optString("minRequiredAppVersion", "").trim()
-            val latest = nativeInfo.optString("latestAndroidVersion", "").trim()
-            val download = nativeInfo.optString("androidDownloadUrl", "")
+            val release = selectAndroidRelease(nativeInfo)
+            val minimum = release
+                ?.optString("minRequiredVersion", "")
+                ?.trim()
+                ?: nativeInfo.optString("minRequiredAppVersion", "").trim()
+            val latest = release
+                ?.optString("version", "")
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: nativeInfo.optString("latestAndroidVersion", "").trim()
+            val download = (release
+                ?.optString("downloadUrl", "")
+                ?: nativeInfo.optString("androidDownloadUrl", ""))
                 .trim()
                 .takeIf { it.isNotEmpty() }
+            val changeLogEntries = release?.optJSONArray("changelog")
+                ?: nativeInfo.optJSONArray("changelog")
             UpdatePolicy(
                 forceUpdate = minimum.isNotEmpty() && compareVersions(current, minimum) < 0,
                 currentVersion = current,
                 minVersion = minimum,
                 latestVersion = latest,
                 downloadUrl = download,
-                changeLog = formatChangeLog(
-                    nativeInfo.optJSONArray("changelog"),
-                    current,
-                    latest,
-                ),
+                changeLog = formatChangeLog(changeLogEntries, current, latest),
             )
         }.getOrNull()
+    }
+
+    /** 从 androidReleases 数组按当前系统版本选择发布条目；不存在或无匹配时回退旧字段。 */
+    private fun selectAndroidRelease(nativeInfo: JSONObject): JSONObject? {
+        val releases = nativeInfo.optJSONArray("androidReleases") ?: return null
+        var selected: JSONObject? = null
+        var selectedMinSdk = Int.MIN_VALUE
+        for (index in 0 until releases.length()) {
+            val item = releases.optJSONObject(index) ?: continue
+            val minSdk = item.optInt("minSdk", 1)
+            val maxSdk = if (item.has("maxSdk")) item.optInt("maxSdk", -1) else -1
+            if (Build.VERSION.SDK_INT < minSdk) continue
+            if (maxSdk >= 0 && Build.VERSION.SDK_INT > maxSdk) continue
+            if (minSdk > selectedMinSdk) {
+                selected = item
+                selectedMinSdk = minSdk
+            }
+        }
+        return selected
     }
 
     private fun formatChangeLog(entries: JSONArray?, current: String, latest: String): String {

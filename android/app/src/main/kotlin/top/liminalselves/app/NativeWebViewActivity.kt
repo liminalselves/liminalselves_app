@@ -1890,43 +1890,13 @@ class NativeWebViewActivity : ComponentActivity() {
         }
 
     private fun startNativePushAndDispatch() {
-        if (!areSystemNotificationsEnabled()) {
-            dispatchNativePushState(registered = false, errorCode = "permission_denied")
-            return
-        }
-        AliyunPushStarter.start(application) { ok, _, err ->
-            if (!ok) {
-                // EMAS 未配置或初始化失败：跳过设备注册，仅同步服务端 enableAppPush 开关。
-                // 这样"APP推送通知"开关仍可作为全局推送总开关控制 WS 保活，
-                // 只是没有阿里云离线推送能力（在线时 WS 消息照常送达）。
-                Log.i(TAG, "EMAS unavailable, skipping device registration; enabling server push flag only")
-                updateAppPushFlagOnMisskey(true) { updated ->
-                    runOnUiThread {
-                        if (updated) {
-                            getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, true).apply()
-                            // 开关打开：立即拉起常驻推送（原生 WS + 前台服务）
-                            ensureNativePushRunning()
-                            dispatchNativePushState(registered = true, errorCode = null)
-                        } else {
-                            dispatchNativePushState(registered = false, errorCode = "push_setup_failed")
-                        }
-                    }
-                }
-                return@start
-            }
-
-            syncEnableStateWithMisskey { synced ->
-                if (synced) {
-                    getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, true).apply()
-                    // 开关打开：立即拉起常驻推送（原生 WS + 前台服务）
-                    runOnUiThread { ensureNativePushRunning() }
-                    dispatchNativePushState(registered = true, errorCode = null)
-                } else {
-                    // 服务端未同步成功时回滚本地状态
-                    AliyunPushStarter.stop()
-                    getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, false).apply()
-                    dispatchNativePushState(registered = false, errorCode = "push_setup_failed")
-                }
+        updateAppPushFlagOnMisskey(true) { updated ->
+            if (updated) {
+                getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, true).apply()
+                ensureNativePushRunning()
+                dispatchNativePushState(registered = true, errorCode = null)
+            } else {
+                dispatchNativePushState(registered = false, errorCode = "push_setup_failed")
             }
         }
     }
@@ -1938,7 +1908,6 @@ class NativeWebViewActivity : ComponentActivity() {
                 dispatchNativePushState(registered = true, errorCode = "push_setup_failed")
                 return@updateAppPushFlagOnMisskey
             }
-            AliyunPushStarter.stop()
             getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, false).apply()
             nativePushRestoreAttempted = false
             // 开关关闭：立即停止常驻推送（原生 WS + 前台服务），避免无推送时仍耗电
@@ -2119,30 +2088,6 @@ class NativeWebViewActivity : ComponentActivity() {
         ensureNativePushRunning()
     }
 
-    private fun registerMobilePushWithMisskey(deviceId: String, cb: (Boolean) -> Unit) {
-        val origin = getMisskeyOrigin()
-        readMisskeyToken { token ->
-            if (token.isNullOrBlank()) {
-                cb(false)
-                return@readMisskeyToken
-            }
-            ioExecutor.execute {
-                val result = callMisskeyPushApi(
-                    "$origin/api/mobile-push/register",
-                    token,
-                    JSONObject().apply {
-                        put("i", token)
-                        put("deviceId", deviceId)
-                        put("platform", "android")
-                    },
-                )
-                mainHandler.post {
-                    if (!isFinishing && !isDestroyed) cb(result.ok)
-                }
-            }
-        }
-    }
-
     private fun updateAppPushFlagOnMisskey(enabled: Boolean, cb: (Boolean) -> Unit) {
         val origin = getMisskeyOrigin()
         readMisskeyToken { token ->
@@ -2162,44 +2107,6 @@ class NativeWebViewActivity : ComponentActivity() {
                 mainHandler.post {
                     if (!isFinishing && !isDestroyed) cb(result.ok)
                 }
-            }
-        }
-    }
-
-    private fun syncEnableStateWithMisskey(cb: (Boolean) -> Unit) {
-        val deviceId = AliyunPushHolder.deviceId
-        if (deviceId.isNullOrBlank()) {
-            cb(false)
-            return
-        }
-        // 先注册设备，再启用服务端开关，避免出现“服务端已开启但设备未注册”导致离线推送失效
-        registerMobilePushWithMisskey(deviceId) { registered ->
-            if (!registered) {
-                cb(false)
-                return@registerMobilePushWithMisskey
-            }
-            updateAppPushFlagOnMisskey(true) { updated ->
-                cb(updated)
-            }
-        }
-    }
-
-    private fun unregisterMobilePushWithMisskey(deviceId: String?) {
-        if (deviceId.isNullOrBlank()) return
-        val origin = Uri.parse(intent.getStringExtra(EXTRA_URL) ?: defaultUrl).let {
-            "${it.scheme}://${it.host}${if (it.port > 0) ":${it.port}" else ""}"
-        }
-        readMisskeyToken { token ->
-            if (token.isNullOrBlank()) return@readMisskeyToken
-            ioExecutor.execute {
-                callMisskeyPushApi(
-                    "$origin/api/mobile-push/unregister",
-                    token,
-                    JSONObject().apply {
-                        put("i", token)
-                        put("deviceId", deviceId)
-                    },
-                )
             }
         }
     }

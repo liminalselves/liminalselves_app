@@ -14,12 +14,10 @@ import 'package:webview_flutter/webview_flutter.dart';
 import 'webview_web_register_stub.dart'
     if (dart.library.html) 'webview_web_register_web.dart';
 
-import 'android_native_webview_launcher.dart';
 import 'embedded_webview_perf.dart';
 import 'keep_alive_service.dart';
 import 'mobile_push.dart';
 import 'shell_version_check.dart';
-import 'webview_file_selector.dart';
 
 /// 默认 Misskey 实例；后续可改为设置页或 `--dart-define=MISSKEY_URL=...`。
 const String kMisskeyBaseUrl = String.fromEnvironment(
@@ -191,8 +189,6 @@ class _MisskeyWebShellState extends State<MisskeyWebShell>
     with WidgetsBindingObserver {
   WebViewController? _controller;
   bool _useEmbeddedWebView = false;
-  bool _launchingNativeAndroid = false;
-  bool _nativeAndroidLaunchFailed = false;
   bool _optionalShellUpdateDialogScheduled = false;
 
   /// 仅驱动顶部细进度条，避免 [onProgress] 高频触发整页 [setState] 导致卡顿。
@@ -302,13 +298,6 @@ class _MisskeyWebShellState extends State<MisskeyWebShell>
   @override
   void initState() {
     super.initState();
-    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
-      _launchingNativeAndroid = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        unawaited(_startAndroidLaunchFlow());
-      });
-      return;
-    }
     final platformOk =
         _inlineWebViewSupported && WebViewPlatform.instance != null;
     _useEmbeddedWebView = platformOk && (!kIsWeb || kAllowWebEmbed);
@@ -319,33 +308,6 @@ class _MisskeyWebShellState extends State<MisskeyWebShell>
     if (!_useEmbeddedWebView) return;
 
     unawaited(_initEmbeddedWebView());
-  }
-
-  Future<void> _openAndroidNativeShell() async {
-    try {
-      final ok = await openAndroidNativeWebView(
-        url: kMisskeyBaseUrl,
-        userAgentMarker: kEmbeddedAppUserAgentMarker,
-      );
-      if (!ok && mounted) {
-        setState(() => _nativeAndroidLaunchFailed = true);
-      }
-    } catch (_) {
-      if (mounted) {
-        setState(() => _nativeAndroidLaunchFailed = true);
-      }
-    }
-  }
-
-  Future<void> _startAndroidLaunchFlow() async {
-    if (!mounted) return;
-    final h = widget.optionalShellUpdateHint;
-    if (h != null) {
-      final openedUpdate = await showOptionalShellUpdateDialog(context, h);
-      if (openedUpdate) return;
-    }
-    if (!mounted) return;
-    await _openAndroidNativeShell();
   }
 
   void _scheduleOptionalShellUpdateDialog() {
@@ -416,9 +378,6 @@ class _MisskeyWebShellState extends State<MisskeyWebShell>
             },
           ),
         );
-      if (defaultTargetPlatform == TargetPlatform.android) {
-        await configureAndroidWebViewFileSelector(controller);
-      }
       await tuneEmbeddedWebViewPerformance(controller);
       unawaited(_tuneWebViewOverScroll(controller));
     }
@@ -775,51 +734,6 @@ class _MisskeyWebShellState extends State<MisskeyWebShell>
 
   @override
   Widget build(BuildContext context) {
-    if (_launchingNativeAndroid) {
-      if (_nativeAndroidLaunchFailed) {
-        return Scaffold(
-          appBar: AppBar(title: const Text('阈界人格')),
-          body: Center(
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Text(
-                    '无法打开原生 WebView 页面，请重试或改用浏览器打开。',
-                    textAlign: TextAlign.center,
-                    style: Theme.of(context).textTheme.bodyLarge,
-                  ),
-                  const SizedBox(height: 24),
-                  FilledButton.icon(
-                    onPressed: () => unawaited(_openAndroidNativeShell()),
-                    icon: const Icon(Icons.refresh),
-                    label: const Text('重试'),
-                  ),
-                  const SizedBox(height: 12),
-                  FilledButton.tonalIcon(
-                    onPressed: _openInExternalBrowser,
-                    icon: const Icon(Icons.open_in_browser),
-                    label: const Text('在浏览器中打开'),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        );
-      }
-      return _whiteSystemBars(
-        child: const Scaffold(
-          backgroundColor: Colors.white,
-          body: SafeArea(
-            child: Center(
-              child: CircularProgressIndicator(color: _kFlutterBlue),
-            ),
-          ),
-        ),
-      );
-    }
-
     if (!_useEmbeddedWebView) {
       return Scaffold(
         appBar: AppBar(title: const Text('阈界人格')),
