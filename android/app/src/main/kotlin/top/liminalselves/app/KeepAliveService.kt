@@ -19,7 +19,7 @@ class KeepAliveService : Service() {
     companion object {
         private const val TAG = "KeepAliveService"
         // 使用新渠道 ID，避免旧渠道重要性无法降级的问题。
-        // 公开供权限向导页（PermissionSetupActivity）检查渠道开关状态。
+        // 公开供权限向导（PermissionSetupActivity）检查渠道开关状态。
         const val CHANNEL_ID = "liminalselves_keepalive_v2"
         private const val OLD_CHANNEL_ID = "liminalselves_keepalive"
         private const val NOTIFICATION_ID = 1001
@@ -27,7 +27,7 @@ class KeepAliveService : Service() {
         const val ACTION_START = "top.liminalselves.app.START_KEEPALIVE"
         const val ACTION_STOP = "top.liminalselves.app.STOP_KEEPALIVE"
 
-        /** 确保保活渠道存在（幂等），供服务自身与权限向导页共用。 */
+        /** 确保保活渠道存在（幂等），供服务自身共用。 */
         fun ensureChannel(context: android.content.Context) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
             val manager = context.getSystemService(NotificationManager::class.java)

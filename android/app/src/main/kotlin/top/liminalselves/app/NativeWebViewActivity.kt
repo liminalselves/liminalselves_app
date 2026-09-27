@@ -67,7 +67,6 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import android.view.ContextThemeWrapper
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import org.json.JSONObject
@@ -83,7 +82,7 @@ class NativeWebViewActivity : ComponentActivity() {
         val statusCode: Int,
         val body: String,
     )
-    private lateinit var swipeRefresh: TopEdgeSwipeRefreshLayout
+    private lateinit var rootContainer: FrameLayout
     private lateinit var webView: WebView
     private lateinit var progressBar: ProgressBar
     private lateinit var errorOverlay: View
@@ -99,9 +98,10 @@ class NativeWebViewActivity : ComponentActivity() {
     private val ioExecutor = Executors.newFixedThreadPool(2)
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var cameraOutputUri: Uri? = null
-    private var nativePushRestoreAttempted = false
-    private var startupPermissionChecked = false
-    private var pendingNotificationPermissionFromStartup = false
+    /** 权限向导正在显示，避免重复拉起。 */
+    private var pushSetupRunning = false
+    /** 启动权限完整性核对正在同步关闭推送，避免重复请求。 */
+    private var startupPushDisableRunning = false
     private var currentUrl: String = defaultUrl
     private var showingErrorPage = false
     private var loadFailedForCurrentNavigation = false
@@ -111,26 +111,25 @@ class NativeWebViewActivity : ComponentActivity() {
     private var keepAliveActive = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
-    /** Misskey WebSocket 当前是否处于 open 状态（由 JS 桥上报），用于保活效果观测。 */
-    @Volatile
-    private var wsConnected = false
     /** 原生 WebSocket 管理器：后台时绕过 WebView JS 节流，独立接收 Misskey 消息。 */
     private val nativeWsManager = NativeWsManager { title, body, openPath ->
         showSystemNotification(title, body, openPath)
     }
 
-    /** 无 WebView 历史可退时：首次返回仅提示，短时内第二次返回才 [finish]。 */
+    /** 系统返回回调：全屏退出 / 历史回退 / 根页面双击退出。 */
+    private lateinit var webBackCallback: OnBackPressedCallback
+
+    /** 根页面首次按返回的时间：短时内第二次返回才退出。 */
     private var lastExitBackPressElapsed = 0L
 
     /** 后台期间保存的 WebView 导航历史：renderer 被系统回收重建时恢复返回栈。 */
     private var savedWebViewState: Bundle? = null
-    private val topPullHotZoneDp = 84
 
     // ─── HTML5 全屏（视频等 Fullscreen API → WebChromeClient.onShowCustomView）───
     /** 当前处于全屏的 WebView 自定义视图（如私信视频点全屏时由引擎提供）。 */
     private var fullscreenCustomView: View? = null
     private var fullscreenCustomViewCallback: WebChromeClient.CustomViewCallback? = null
-    // 壳层采用 Flutter 风格蓝色系；仅作用于加载与下拉反馈，不改变站内导航逻辑。
+    // 壳层采用 Flutter 风格蓝色系；仅作用于加载进度与错误页等壳层元素，不改变站内导航逻辑。
     private val lightChromeColor = Color.parseColor("#F7F9F5")
     private val darkChromeColor = Color.parseColor("#15171C")
 
@@ -139,16 +138,15 @@ class NativeWebViewActivity : ComponentActivity() {
         get() = if (pageThemeDark) darkChromeColor else lightChromeColor
     private val accentColor = Color.parseColor("#1A73E8")
     private val accentColorDark = Color.parseColor("#1557B0")
-    private val accentTrackColor = Color.parseColor("#D6E4FF")
-    // 顶部加载条与下拉刷新均使用蓝色系。
+    // 顶部加载条使用蓝色系。
     private val progressBarColor = Color.parseColor("#1A73E8")
     private val progressBarTrackColor = Color.parseColor("#D6E4FF")
     private var lastChromeColor = lightChromeColor
 
     /**
-     * Misskey 当前生效主题是否为深色：由网页上报的背景色亮度推导
-     * （installChromeColorSyncBridge 实时同步，含站内手动切换主题），
-     * 页面未上报前以系统深浅兜底。壳层对话框/错误页/下拉刷新等据此跟随站内深浅，
+     * Misskey 当前生效主题是否为深色：由网页上报的 meta theme-color（站内 @bg）
+     * 亮度推导（embedded-shell 经 AppChrome 桥实时同步，含站内手动切换主题），
+     * 页面未上报前以系统深浅兜底。壳层对话框/错误页/加载条等据此跟随站内深浅，
      * 而非跟随系统——站内「跟随设备」或手动选择都收敛到同一表现。
      */
     private var pageThemeDark = false
@@ -164,17 +162,11 @@ class NativeWebViewActivity : ComponentActivity() {
         pendingChromeColor = null
         applyChromeColorNow(c)
     }
-    private val refreshChromeColorRunnable = Runnable {
-        if (!isFinishing && !isDestroyed && ::webView.isInitialized) {
-            updateChromeColorFromWebPage()
-        }
-    }
 
     private val fileChooserLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             val cb = filePathCallback
             filePathCallback = null
-            if (cb == null) return@registerForActivityResult
 
             val uris: Array<Uri> = when {
                 result.resultCode != RESULT_OK -> emptyArray()
@@ -186,22 +178,53 @@ class NativeWebViewActivity : ComponentActivity() {
                 cameraOutputUri != null -> arrayOf(cameraOutputUri!!)
                 else -> emptyArray()
             }
+            // 每次选择流程结束即清空，避免残留的拍照输出 URI 串扰下一次非拍照选择
+            cameraOutputUri = null
+            if (cb == null) return@registerForActivityResult
             cb.onReceiveValue(uris)
         }
 
-    private val requestPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) {
+    /** 权限向导完成后才真正启用推送；取消/未完成则保持关闭。 */
+    private val pushSetupLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            pushSetupRunning = false
+            if (result.resultCode == RESULT_OK) {
                 startNativePushAndDispatch()
             } else {
                 dispatchNativePushState(registered = false, errorCode = "permission_denied")
-                if (pendingNotificationPermissionFromStartup) {
-                    disableNativePushFromBridge()
-                    dispatchNativePushAlert()
-                }
             }
-            pendingNotificationPermissionFromStartup = false
         }
+
+    // ─── WebView 权限（WebRTC getUserMedia 等）──────────────────────────────
+    /** 等待运行时权限结果的 WebView 权限请求（同一时刻最多一个，新请求会使旧的被拒绝）。 */
+    private var pendingWebPermissionRequest: PermissionRequest? = null
+
+    private val webPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+            val request = pendingWebPermissionRequest
+            pendingWebPermissionRequest = null
+            if (request == null) return@registerForActivityResult
+            // 只授予运行时权限获批对应的 Web 资源，其余（含未知资源）全部拒绝
+            val grantedResources = request.resources.filter { resource ->
+                val mapped = when (resource) {
+                    PermissionRequest.RESOURCE_VIDEO_CAPTURE -> Manifest.permission.CAMERA
+                    PermissionRequest.RESOURCE_AUDIO_CAPTURE -> Manifest.permission.RECORD_AUDIO
+                    else -> null
+                }
+                mapped != null && grants[mapped] == true
+            }
+            if (grantedResources.isEmpty()) {
+                request.deny()
+            } else {
+                request.grant(grantedResources.toTypedArray())
+            }
+        }
+
+    /** 页面/Activity 销毁时清理未决的 WebView 权限请求。 */
+    private fun denyPendingWebPermission() {
+        pendingWebPermissionRequest?.deny()
+        pendingWebPermissionRequest = null
+    }
 
     // ─── 文件下载 ───────────────────────────────────────────────────────────
     // 存储权限获批后需要重放的下载动作（授权弹窗期间挂起，授予后继续执行）。
@@ -215,7 +238,7 @@ class NativeWebViewActivity : ComponentActivity() {
             if (granted) {
                 action()
             } else {
-                Toast.makeText(this, "存储权限被拒绝，无法保存文件", Toast.LENGTH_SHORT).show()
+                showToastIfForeground("存储权限被拒绝，无法保存文件")
             }
         }
 
@@ -241,25 +264,92 @@ class NativeWebViewActivity : ComponentActivity() {
             val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
             if (id < 0) return
             val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-            val uri = dm.getUriForDownloadedFile(id) ?: return
-            Toast.makeText(this@NativeWebViewActivity, "下载完成", Toast.LENGTH_SHORT).show()
-            // 尝试打开文件
-            runCatching {
-                val openIntent = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(uri, dm.getMimeTypeForDownloadedFile(id) ?: "*/*")
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            // ACTION_DOWNLOAD_COMPLETE 对成功/失败都会发出，须查状态区分
+            val cursor = dm.query(DownloadManager.Query().setFilterById(id))
+            cursor?.use { c ->
+                if (!c.moveToFirst()) return
+                val statusIndex = c.getColumnIndex(DownloadManager.COLUMN_STATUS)
+                if (statusIndex >= 0 && c.getInt(statusIndex) != DownloadManager.STATUS_SUCCESSFUL) {
+                    val reasonIndex = c.getColumnIndex(DownloadManager.COLUMN_REASON)
+                    val reason = if (reasonIndex >= 0) c.getString(reasonIndex).orEmpty() else ""
+                    showToastIfForeground(if (reason.isBlank()) "下载失败" else "下载失败: $reason")
+                    return
                 }
-                startActivity(openIntent)
-            }.onFailure {
-                Log.w(TAG, "Cannot open downloaded file: ${it.message}")
+                // 与 blob/data 下载反馈保持一致：完成后提示实际落盘文件名（含冲突自动改名后的名字）
+                val uri = dm.getUriForDownloadedFile(id) ?: return
+                var savedName: String? = null
+                runCatching {
+                    contentResolver.query(
+                        uri,
+                        arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                        null,
+                        null,
+                        null,
+                    )?.use { nameCursor ->
+                        if (nameCursor.moveToFirst()) savedName = nameCursor.getString(0)
+                    }
+                }
+                val savedLabel = savedName?.takeIf { it.isNotBlank() } ?: "文件"
+                if (LiminalApplication.isAppInForeground()) {
+                    showToastIfForeground("已保存到 Download/: $savedLabel")
+                } else {
+                    notifyDownloadComplete(savedLabel, uri, dm.getMimeTypeForDownloadedFile(id))
+                }
             }
         }
+    }
+
+    /**
+     * 统一的用户反馈通道：仅前台以 Toast 提示；后台静默
+     * （系统通知由各自的机制负责，Toast 不越过当前应用弹出）。
+     */
+    private fun showToastIfForeground(message: String) {
+        if (!LiminalApplication.isAppInForeground()) return
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * 后台下载完成的系统通知（前台走 Toast，避免双提示）：静默入栏、点击打开文件。
+     * 复用互动通知渠道（LOW，静默）；打开失败时通知仅作提示（无可点击动作）。
+     */
+    private fun notifyDownloadComplete(fileName: String, uri: Uri?, mimeType: String?) {
+        if (LiminalApplication.isAppInForeground()) return
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            ensureMisskeyChannels(this)
+        }
+        val builder = NotificationCompat.Builder(this, CHANNEL_MISSKEY_NOTIFY)
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setContentTitle("下载完成")
+            .setContentText(fileName)
+            .setStyle(NotificationCompat.BigTextStyle().bigText("已保存到 Download/: $fileName"))
+            .setAutoCancel(true)
+            .setSilent(true)
+        if (uri != null) {
+            val openIntent = runCatching {
+                PendingIntent.getActivity(
+                    this,
+                    fileName.hashCode(),
+                    Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(uri, mimeType ?: "*/*")
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    },
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                )
+            }.getOrNull()
+            openIntent?.let { builder.setContentIntent(it) }
+        }
+        NotificationManagerCompat.from(this).notify(fileName.hashCode(), builder.build())
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // 站内深浅初始值：尚无网页上报，先按系统深浅兜底（msk 默认「跟随设备」），
-        // 页面就绪后由 AppChrome 上报的背景色纠正（含用户在站内手动切换的主题）。
+        // 页面就绪后由 meta theme-color（AppChrome 桥实时上报，含用户站内手动切换的主题）纠正。
         pageThemeDark = isSystemNightMode()
         lastChromeColor = defaultChromeColor
         overridePendingTransition(0, 0)
@@ -268,44 +358,36 @@ class NativeWebViewActivity : ComponentActivity() {
         applyPersistentSystemBars()
         setupViews()
         setupWebView()
-        // RECEIVER_NOT_EXPORTED 的带 flags 重载为 API 26+，API 24/25 需经 ContextCompat 兼容分发
+        // ACTION_DOWNLOAD_COMPLETE 由系统下载服务（另一应用）发出，Android 13+ 上
+        // NOT_EXPORTED 注册收不到该广播（低版本 ContextCompat 回退为无 flag 注册才能收到），
+        // 必须用 EXPORTED；该广播受系统保护，安全性不受影响。
         ContextCompat.registerReceiver(
             this,
             downloadCompleteReceiver,
             IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
-            ContextCompat.RECEIVER_NOT_EXPORTED,
+            ContextCompat.RECEIVER_EXPORTED,
         )
-        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+        webBackCallback = object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                // 视频等 HTML5 全屏时，返回键先退出全屏而非退出页面
+                // 1) 视频等 HTML5 全屏：返回键先退出全屏而非退出页面
                 if (exitFullscreenCustomViewIfActive()) return
-                // 实时从 WebView 引擎获取当前 URL，避免 SPA pushState 后 currentUrl 滞后
-                val actualUrl = webView.url ?: currentUrl
-                val path = Uri.parse(actualUrl).path.orEmpty()
-                val atSectionRoot = isSectionRootPath(path)
-
-                // 非板块根且有历史 → 正常回退
-                if (!atSectionRoot && webView.canGoBack()) {
+                // 2) WebView 自身历史可退 → 引擎内回退（SPA pushState 历史亦由引擎统一管理）
+                if (webView.canGoBack()) {
                     lastExitBackPressElapsed = 0L
                     webView.goBack()
                     return
                 }
-                // 板块根或无历史：双击退出
+                // 3) 根页面（无历史）：首次返回仅提示，2 秒内再次返回才退出应用
                 val now = SystemClock.elapsedRealtime()
-                if (lastExitBackPressElapsed != 0L &&
-                    now - lastExitBackPressElapsed <= EXIT_CONFIRM_MS
-                ) {
+                if (lastExitBackPressElapsed != 0L && now - lastExitBackPressElapsed <= EXIT_CONFIRM_MS) {
                     finish()
                     return
                 }
                 lastExitBackPressElapsed = now
-                Toast.makeText(
-                    this@NativeWebViewActivity,
-                    SNACK_EXIT_BACK_HINT,
-                    Toast.LENGTH_SHORT,
-                ).show()
+                Toast.makeText(this@NativeWebViewActivity, EXIT_BACK_HINT, Toast.LENGTH_SHORT).show()
             }
-        })
+        }
+        onBackPressedDispatcher.addCallback(this, webBackCallback)
         // 系统回收/旋转重建 Activity 时 WebView 历史不会自动恢复，
         // 优先从实例状态恢复导航历史，避免返回键/站内返回按钮失效。
         val url = resolveLaunchUrl(intent)
@@ -321,8 +403,11 @@ class NativeWebViewActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         if (!::webView.isInitialized) return
+        // 仅真正的深链（通知点击携带 extraMap.openUrl）才导航到目标页；
+        // 普通回前台重入（无 extraMap）不重新加载页面，保留用户当前浏览状态。
+        if (intent.getStringExtra("extraMap").isNullOrBlank()) return
         val url = resolveLaunchUrl(intent)
-        if (url.isBlank()) return
+        if (url.isBlank() || url == defaultUrl) return
         currentUrl = url
         loadUrl(url)
     }
@@ -351,6 +436,19 @@ class NativeWebViewActivity : ComponentActivity() {
         val stored = getPrefs().getString(PREF_LAST_MISSKEY_ORIGIN, null) ?: return false
         val sh = runCatching { Uri.parse(stored).host }.getOrNull() ?: return false
         return host == sh
+    }
+
+    /** WebView 权限请求的来源校验：仅允许可信 Misskey origin（与外链守卫同一信任域）。 */
+    private fun isTrustedMisskeyPermissionOrigin(origin: Uri?): Boolean {
+        if (origin == null) return false
+        val scheme = origin.scheme?.lowercase() ?: return false
+        if (scheme != "http" && scheme != "https") return false
+        val host = origin.host?.lowercase() ?: return false
+        val defHost = Uri.parse(defaultUrl).host?.lowercase()
+        if (defHost != null && host == defHost) return true
+        val stored = getPrefs().getString(PREF_LAST_MISSKEY_ORIGIN, null) ?: return false
+        val storedHost = runCatching { Uri.parse(stored).host?.lowercase() }.getOrNull() ?: return false
+        return host == storedHost
     }
 
     private fun persistTrustedMisskeyOrigin(pageUrl: String?) {
@@ -415,7 +513,7 @@ class NativeWebViewActivity : ComponentActivity() {
         fullscreenCustomViewCallback = callback
         // 视频全屏期间保持屏幕常亮
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        // 加到 DecorView（而非 contentFrame：后者在 swipeRefresh 内会被 insets padding 缩进，
+        // 加到 DecorView（而非 contentFrame：后者在 rootContainer 内会被 insets padding 缩进，
         // 加到 DecorView 才能真正覆盖状态栏/导航栏区域）。
         (window.decorView as ViewGroup).addView(
             view,
@@ -471,7 +569,10 @@ class NativeWebViewActivity : ComponentActivity() {
             userAgentString = "${userAgentString ?: ""} $marker".trim()
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, true)
+            // waived=false：不可见时渲染器跟随应用进程优先级而非降为“可随时回收”。
+            // 此前为 true 时，内存紧张的 ROM（华为等）几乎每次切后台都会杀掉渲染器，
+            // 回前台触发 onRenderProcessGone → 整页重建刷新。
+            webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, false)
         }
         webView.overScrollMode = WebView.OVER_SCROLL_IF_CONTENT_SCROLLS
         // 深色模式下底色同步压黑：避免站点应用深色主题前的白屏闪变
@@ -492,7 +593,6 @@ class NativeWebViewActivity : ComponentActivity() {
         webView.addJavascriptInterface(AppChromeBridge(), "AppChrome")
         webView.addJavascriptInterface(AppNavBridge(), "AppNav")
         webView.addJavascriptInterface(AppDownloadBridge(), "AppDownload")
-        webView.addJavascriptInterface(AppWsBridge(), "AppWs")
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
                 view: WebView?,
@@ -507,22 +607,19 @@ class NativeWebViewActivity : ComponentActivity() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 currentUrl = url ?: currentUrl
                 loadFailedForCurrentNavigation = false
-                swipeRefresh.isRefreshing = true
+                // 服务端初始 meta theme-color 是实例强调色，不能拿来染系统栏；
+                // 页面加载阶段保持壳层深浅底色，等 Misskey theme.ts 应用真实主题后由 AppChrome 上报。
+                applySystemBarColor(defaultChromeColor)
+                // 页面导航的刷新反馈只保留顶部进度条（onProgressChanged）；
+                // 原生刷新圈已随页面级下拉刷新一起移除。
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
-                swipeRefresh.isRefreshing = false
                 if (loadFailedForCurrentNavigation) return
                 persistTrustedMisskeyOrigin(url)
-                installChromeColorSyncBridge()
-                updateChromeColorFromWebPage()
                 injectLiminalAppInfo()
-                installSpaNavWatcher()
-                installWsStateWatcher()
                 installBlobDownloadShim()
-                reconcileStartupNotificationPermission()
                 injectNativePushStateFromPrefs()
-                onPageReadyForPushRestore()
                 snapshotWebViewHistory()
             }
 
@@ -572,7 +669,6 @@ class NativeWebViewActivity : ComponentActivity() {
                     null
                 }
                 Log.w(TAG, "WebView render process gone. didCrash=$didCrash")
-                swipeRefresh.isRefreshing = false
                 view?.destroy()
                 recreateWebViewAndReload()
                 return true
@@ -585,7 +681,37 @@ class NativeWebViewActivity : ComponentActivity() {
             }
 
             override fun onPermissionRequest(request: PermissionRequest?) {
-                request?.grant(request.resources)
+                if (request == null) return
+                // 只信任站内（Misskey 实例）origin 发起的权限请求
+                if (!isTrustedMisskeyPermissionOrigin(request.origin)) {
+                    Log.w(TAG, "Web permission request from untrusted origin: ${request.origin}")
+                    request.deny()
+                    return
+                }
+                // 仅处理摄像头/麦克风采集；未知资源一律拒绝
+                val mapped = request.resources.mapNotNull { resource ->
+                    when (resource) {
+                        PermissionRequest.RESOURCE_VIDEO_CAPTURE -> resource to Manifest.permission.CAMERA
+                        PermissionRequest.RESOURCE_AUDIO_CAPTURE -> resource to Manifest.permission.RECORD_AUDIO
+                        else -> null
+                    }
+                }
+                if (mapped.isEmpty()) {
+                    request.deny()
+                    return
+                }
+                val missing = mapped.map { it.second }
+                    .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+                    .distinct()
+                if (missing.isEmpty()) {
+                    // 只授予已映射且已获批的资源（请求中可能混有未知资源，不得一并授予）
+                    request.grant(mapped.map { it.first }.toTypedArray())
+                    return
+                }
+                // 单个未决请求：新请求到来时先拒绝旧的
+                pendingWebPermissionRequest?.deny()
+                pendingWebPermissionRequest = request
+                webPermissionLauncher.launch(missing.toTypedArray())
             }
 
             /**
@@ -673,34 +799,13 @@ class NativeWebViewActivity : ComponentActivity() {
         // Theme.Light 保持壳层浅色不变。系统深浅色切换会触发 Activity 重建，
         // 届时以新配置重新解析该主题，站内 matchMedia 即得到正确结果。
         webView = WebView(ContextThemeWrapper(this, R.style.Theme_Liminal_WebView))
-        swipeRefresh = TopEdgeSwipeRefreshLayout(this).apply {
-            hotZonePx = dp(topPullHotZoneDp)
-            statusBarInsetProvider = {
-                ViewCompat.getRootWindowInsets(window.decorView)
-                    ?.getInsets(WindowInsetsCompat.Type.statusBars())
-                    ?.top ?: 0
-            }
-            canChildScrollUpProvider = { webView.canScrollVertically(-1) }
-            isEnabled = true
-            // 下拉刷新旋转指示器：统一品牌色，避免默认黄/蓝；
-            // 指示器圆底色由 applyShellPalette 按站内深浅设置。
-            setColorSchemeColors(accentColor, accentColorDark)
-            // 只下移刷新指示器位置，保持当前触发/回弹手感不变。
-            setProgressViewOffset(false, dp(18), dp(62))
-            setOnRefreshListener {
-                if (showingErrorPage) {
-                    retryFromErrorPage()
-                } else {
-                    // 使用 webView.reload() 而非 loadUrl(currentUrl)：
-                    // SPA pushState 路由不触发 onPageStarted，currentUrl 可能滞后；
-                    // reload() 始终重新加载 WebView 引擎实际跟踪的当前 URL。
-                    webView.reload()
-                }
-            }
+        // 原生页面级下拉刷新已移除：刷新手势完全交由 Misskey Web 自身的
+        // pull-to-refresh 处理，壳层只在主文档加载期间展示顶部进度条。
+        rootContainer = FrameLayout(this).apply {
+            setBackgroundColor(defaultChromeColor)
         }
         // 透明状态栏下，把安全区显式变成顶部 padding，避免刘海/状态栏遮挡内容。
-        swipeRefresh.setBackgroundColor(defaultChromeColor)
-        ViewCompat.setOnApplyWindowInsetsListener(swipeRefresh) { v, insets ->
+        ViewCompat.setOnApplyWindowInsetsListener(rootContainer) { v, insets ->
             val bars = insets.getInsets(
                 WindowInsetsCompat.Type.statusBars() or WindowInsetsCompat.Type.navigationBars(),
             )
@@ -744,7 +849,7 @@ class NativeWebViewActivity : ComponentActivity() {
                 FrameLayout.LayoutParams.MATCH_PARENT,
             ),
         )
-        swipeRefresh.addView(
+        rootContainer.addView(
             frame,
             ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -752,14 +857,11 @@ class NativeWebViewActivity : ComponentActivity() {
             ),
         )
         applyShellPalette()
-        setContentView(swipeRefresh)
+        setContentView(rootContainer)
     }
 
-    /** 壳层随站内深浅变化的调色板应用：下拉刷新指示器圆底 + 加载条轨道。 */
+    /** 壳层随站内深浅变化的调色板应用：顶部进度条轨道。 */
     private fun applyShellPalette() {
-        swipeRefresh.setProgressBackgroundColorSchemeColor(
-            if (pageThemeDark) Color.parseColor("#22262E") else Color.WHITE,
-        )
         progressBar.progressBackgroundTintList = ColorStateList.valueOf(
             if (pageThemeDark) Color.parseColor("#1F3A66") else progressBarTrackColor,
         )
@@ -972,86 +1074,9 @@ class NativeWebViewActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * 仅在"手势起点位于顶部热区"且"WebView 已在顶端"时允许触发刷新。
-     * 在父容器 onIntercept 阶段判断，规避 dispatchTouchEvent 与 SwipeRefreshLayout 的时序竞争。
-     *
-     * 方向锁定机制：手势超过 touch slop 后根据轨迹角度判断水平/垂直意图，
-     * 水平意图为主时永久拒绝拦截，避免与页面内横向导航栏滑动冲突。
-     */
-    private class TopEdgeSwipeRefreshLayout(context: Context) : SwipeRefreshLayout(context) {
-        var hotZonePx: Int = 0
-        var statusBarInsetProvider: (() -> Int)? = null
-        var canChildScrollUpProvider: (() -> Boolean)? = null
-    
-        private var gestureEligible = false
-        private var downX = 0f
-        private var downY = 0f
-        private val touchSlop = android.view.ViewConfiguration.get(context).scaledTouchSlop
-        /** 热区内使用更大的触发阈值（1.8 倍 touch slop），容忍水平滑动时的垂直抖动。 */
-        private val verticalTriggerSlop = (touchSlop * 1.8f).toInt()
-        /** 方向锁定状态：0=未确定, 1=垂直(允许刷新), -1=水平(拒绝刷新) */
-        private var directionLock = 0
-    
-        override fun onInterceptTouchEvent(ev: android.view.MotionEvent): Boolean {
-            when (ev.actionMasked) {
-                android.view.MotionEvent.ACTION_DOWN -> {
-                    val statusTop = statusBarInsetProvider?.invoke() ?: 0
-                    val inHotZone = ev.y <= (statusTop + hotZonePx)
-                    val canScrollUp = canChildScrollUpProvider?.invoke() ?: true
-                    gestureEligible = inHotZone && !canScrollUp
-                    downX = ev.x
-                    downY = ev.y
-                    directionLock = 0
-                }
-                android.view.MotionEvent.ACTION_MOVE -> {
-                    if (gestureEligible && directionLock == 0) {
-                        val dx = Math.abs(ev.x - downX)
-                        val dy = Math.abs(ev.y - downY)
-                        if (dx > touchSlop || dy > verticalTriggerSlop) {
-                            directionLock = if (dx > dy) {
-                                // 水平意图为主 → 拒绝拦截，让 WebView 处理横向滚动
-                                -1
-                            } else if (dy > dx * 0.577f) {
-                                // 垂直分量占优（角度 > 30° 偏离水平）→ 允许刷新
-                                1
-                            } else {
-                                -1
-                            }
-                            if (directionLock == -1) {
-                                gestureEligible = false
-                            }
-                        } else {
-                            // 尚未超过阈值，不拦截，继续观察
-                            return false
-                        }
-                    }
-                }
-                android.view.MotionEvent.ACTION_UP,
-                android.view.MotionEvent.ACTION_CANCEL -> {
-                    gestureEligible = false
-                    directionLock = 0
-                }
-            }
-            if (!gestureEligible) return false
-            // 方向已锁定为水平时不拦截
-            if (directionLock == -1) return false
-            return super.onInterceptTouchEvent(ev)
-        }
-    
-        override fun onTouchEvent(ev: android.view.MotionEvent): Boolean {
-            if (!gestureEligible && !isRefreshing) return false
-            if (ev.actionMasked == android.view.MotionEvent.ACTION_UP ||
-                ev.actionMasked == android.view.MotionEvent.ACTION_CANCEL
-            ) {
-                gestureEligible = false
-                directionLock = 0
-            }
-            return super.onTouchEvent(ev)
-        }
-    }
-
     private fun recreateWebViewAndReload() {
+        // 旧 WebView 即将销毁：未决权限请求一并拒绝
+        denyPendingWebPermission()
         setupViews()
         setupWebView()
         // renderer 被系统回收：优先恢复后台时保存的历史栈（返回键/站内返回才有效），
@@ -1105,41 +1130,15 @@ class NativeWebViewActivity : ComponentActivity() {
         }
     }
 
-    private fun updateChromeColorFromWebPage() {
-        val js = """
-            (function() {
-              try {
-                // 只取“页面背景色”，不要用 header/theme-color（Misskey 常为强调绿，会把系统栏染绿/黄）。
-                var roots = [document.body, document.documentElement];
-                for (var i = 0; i < roots.length; i++) {
-                  var el = roots[i];
-                  if (!el) continue;
-                  var c = getComputedStyle(el).backgroundColor;
-                  if (!c) continue;
-                  if (c === 'rgba(0, 0, 0, 0)' || c === 'transparent') continue;
-                  return c;
-                }
-              } catch (_) {}
-              return '';
-            })();
-        """.trimIndent()
-        webView.evaluateJavascript(js) { raw ->
-            val parsed = parseJsColor(raw)
-            val color = parsed ?: defaultChromeColor
-            if (color == lastChromeColor) return@evaluateJavascript
-            runOnUiThread { applyChromeColorNow(color) }
-        }
-    }
-
     private fun applyChromeColorNow(color: Int) {
-        // 由页面背景亮度推导站内深浅：壳层对话框/错误页/下拉刷新等据此跟随
+        // 由页面背景亮度推导站内深浅：壳层对话框/错误页/加载条等据此跟随
         // Misskey 实际生效的主题（站内切换主题会触发 AppChrome 上报，实时联动）。
         if (!isLightColor(color) != pageThemeDark) {
             pageThemeDark = !isLightColor(color)
             applyShellPalette()
         }
         if (color == lastChromeColor) return
-        swipeRefresh.setBackgroundColor(color)
+        rootContainer.setBackgroundColor(color)
         applySystemBarColor(color)
     }
 
@@ -1167,61 +1166,6 @@ class NativeWebViewActivity : ComponentActivity() {
         val b = Color.blue(color)
         // YIQ luma approximation
         return ((r * 299) + (g * 587) + (b * 114)) / 1000 >= 168
-    }
-
-    private fun installChromeColorSyncBridge() {
-        val js = """
-            (function() {
-              if (window.__LIMINAL_CHROME_SYNC_INSTALLED__) return;
-              window.__LIMINAL_CHROME_SYNC_INSTALLED__ = true;
-              function pickColor() {
-                try {
-                  var roots = [document.body, document.documentElement];
-                  for (var i = 0; i < roots.length; i++) {
-                    var el = roots[i];
-                    if (!el) continue;
-                    var c = getComputedStyle(el).backgroundColor;
-                    if (!c) continue;
-                    if (c === 'rgba(0, 0, 0, 0)' || c === 'transparent') continue;
-                    return c;
-                  }
-                } catch (_) {}
-                return '';
-              }
-              var lastColor = '';
-              var pending = 0;
-              function notify() {
-                try {
-                  var c = pickColor();
-                  if (c === lastColor) return;
-                  lastColor = c;
-                  if (window.AppChrome && window.AppChrome.postColor) {
-                    window.AppChrome.postColor(c || '');
-                  }
-                } catch (_) {}
-              }
-              function scheduleNotify() {
-                if (pending) clearTimeout(pending);
-                pending = setTimeout(function() {
-                  pending = 0;
-                  notify();
-                }, 160);
-              }
-              // 恢复/首次渲染期经常先拿到透明色，做 2 帧重试。
-              notify();
-              requestAnimationFrame(scheduleNotify);
-              var mo = new MutationObserver(scheduleNotify);
-              var options = {attributes:true, attributeFilter:['class', 'style', 'data-theme']};
-              if (document.documentElement) mo.observe(document.documentElement, options);
-              if (document.body) mo.observe(document.body, options);
-              document.addEventListener('visibilitychange', function() {
-                if (!document.hidden) scheduleNotify();
-              }, true);
-              window.addEventListener('focus', scheduleNotify, true);
-              window.addEventListener('pageshow', scheduleNotify, true);
-            })();
-        """.trimIndent()
-        webView.evaluateJavascript(js, null)
     }
 
     private fun parseJsColor(raw: String?): Int? {
@@ -1275,9 +1219,12 @@ class NativeWebViewActivity : ComponentActivity() {
      * 处理 window.open() 拦截到的 URL：
      * 站内域名（liminalselves.top 及其子域名）在当前 WebView 内加载；
      * 站外域名弹出确认对话框后在系统浏览器打开，避免隐式跳转。
+     * about:blank 等内部协议（前端用于占位窗口等）不触发离站确认，静默忽略。
      */
     private fun handleWindowOpenUrl(rawUrl: String) {
         val uri = Uri.parse(rawUrl)
+        val scheme = uri.scheme?.lowercase()
+        if (scheme in setOf("about", "javascript", "blob", "data")) return
         val host = uri.host?.lowercase().orEmpty()
         if (host == "liminalselves.top" || host.endsWith(".liminalselves.top")) {
             // 站内域名：在当前 WebView 内打开
@@ -1298,7 +1245,8 @@ class NativeWebViewActivity : ComponentActivity() {
         try {
             startActivity(Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE))
         } catch (_: ActivityNotFoundException) {
-            // ignore
+            // 无可处理该链接的应用（常见为无浏览器）：给出明确反馈而非静默失败
+            showToastIfForeground("无法在系统中打开该链接")
         }
     }
 
@@ -1312,7 +1260,6 @@ class NativeWebViewActivity : ComponentActivity() {
         loadFailedForCurrentNavigation = true
         showingErrorPage = true
         currentUrl = failingUrl
-        swipeRefresh.isRefreshing = false
         progressBar.visibility = View.GONE
         view?.stopLoading()
         webView.visibility = View.INVISIBLE
@@ -1358,7 +1305,7 @@ class NativeWebViewActivity : ComponentActivity() {
         hideLoadErrorPage()
         loadFailedForCurrentNavigation = false
         webView.visibility = View.VISIBLE
-        swipeRefresh.isRefreshing = true
+        // 唯一的初始主文档进度反馈：顶部水平进度条（后续由 onProgressChanged 驱动）。
         progressBar.progress = 5
         progressBar.visibility = View.VISIBLE
         webView.stopLoading()
@@ -1434,6 +1381,9 @@ class NativeWebViewActivity : ComponentActivity() {
         val mime = mimetype?.takeIf { it.isNotBlank() }
             ?: guessMimeType(fileName, url)
 
+        // 开始即给出反馈：HTTP 的进度通知要等系统拉起才有，blob/data 完全无系统反馈
+        showToastIfForeground("开始下载：$fileName")
+
         // 三类下载统一保存到公共 Download/ 目录，权限策略一致（29+ 免权限，≤28 先申请再重放）。
         when {
             url.startsWith("blob:") -> ensurePublicDownloadPermissionThen { downloadBlobViaJs(url, fileName, mime) }
@@ -1456,7 +1406,9 @@ class NativeWebViewActivity : ComponentActivity() {
                 userAgent?.let { addRequestHeader("User-Agent", it) }
                 setTitle(fileName)
                 setDescription("正在下载…")
-                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                // 只保留下载中的进度通知；完成反馈由统一的前台 Toast 给出，
+                // 避免系统完成通知 + Toast 双重提示。
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
                 // 保存到公共 Download 目录（/storage/emulated/0/Download/），
                 // DownloadManager 有特权写入公共目录，无需额外权限；文件名冲突由 DM 自动追加后缀。
                 setDestinationInExternalPublicDir(
@@ -1467,10 +1419,9 @@ class NativeWebViewActivity : ComponentActivity() {
                 setAllowedOverRoaming(false)
             }
             dm.enqueue(request)
-            Toast.makeText(this, "开始下载: $fileName", Toast.LENGTH_SHORT).show()
         }.onFailure {
             Log.w(TAG, "DownloadManager enqueue failed: ${it.message}")
-            Toast.makeText(this, "下载失败: ${it.message}", Toast.LENGTH_SHORT).show()
+            showToastIfForeground("下载失败: ${it.message}")
         }
     }
 
@@ -1571,7 +1522,7 @@ class NativeWebViewActivity : ComponentActivity() {
                 android.util.Base64.decode(dataUrl.substringAfter(","), android.util.Base64.DEFAULT)
             }.getOrElse {
                 mainHandler.post {
-                    Toast.makeText(this, "保存失败: ${it.message}", Toast.LENGTH_SHORT).show()
+                    showToastIfForeground("保存失败: ${it.message}")
                 }
                 return@execute
             }
@@ -1590,6 +1541,7 @@ class NativeWebViewActivity : ComponentActivity() {
      */
     private fun saveBytesToPublicDownloads(bytes: ByteArray, fileName: String, mimeType: String) {
         runCatching {
+            var savedUri: Uri? = null
             val savedName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val resolver = contentResolver
                 val values = ContentValues().apply {
@@ -1604,6 +1556,7 @@ class NativeWebViewActivity : ComponentActivity() {
                 values.clear()
                 values.put(MediaStore.Downloads.IS_PENDING, 0)
                 resolver.update(contentUri, values, null, null)
+                savedUri = contentUri
                 // 同名文件由 MediaStore 自动追加序号，读回实际文件名用于提示
                 resolver.query(
                     contentUri,
@@ -1622,12 +1575,16 @@ class NativeWebViewActivity : ComponentActivity() {
                 file.name
             }
             mainHandler.post {
-                Toast.makeText(this, "已保存到 Download/: $savedName", Toast.LENGTH_SHORT).show()
+                if (LiminalApplication.isAppInForeground()) {
+                    showToastIfForeground("已保存到 Download/: $savedName")
+                } else {
+                    notifyDownloadComplete(savedName, savedUri, mimeType)
+                }
             }
         }.onFailure {
             Log.w(TAG, "Save public download failed: ${it.message}")
             mainHandler.post {
-                Toast.makeText(this, "保存失败: ${it.message}", Toast.LENGTH_SHORT).show()
+                showToastIfForeground("保存失败: ${it.message}")
             }
         }
     }
@@ -1689,7 +1646,7 @@ class NativeWebViewActivity : ComponentActivity() {
             val name = fileName?.takeIf { it.isNotBlank() } ?: "download_${System.currentTimeMillis()}"
             val mime = mimeType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
             if (data.isEmpty()) {
-                runOnUiThread { Toast.makeText(this@NativeWebViewActivity, "下载失败: 空数据", Toast.LENGTH_SHORT).show() }
+                runOnUiThread { showToastIfForeground("下载失败: 空数据") }
                 return
             }
             ioExecutor.execute {
@@ -1698,7 +1655,7 @@ class NativeWebViewActivity : ComponentActivity() {
                     saveBytesToPublicDownloads(bytes, name, mime)
                 }.onFailure {
                     mainHandler.post {
-                        Toast.makeText(this@NativeWebViewActivity, "保存失败: ${it.message}", Toast.LENGTH_SHORT).show()
+                        showToastIfForeground("保存失败: ${it.message}")
                     }
                 }
             }
@@ -1707,7 +1664,7 @@ class NativeWebViewActivity : ComponentActivity() {
         @JavascriptInterface
         fun onBlobError(error: String?) {
             runOnUiThread {
-                Toast.makeText(this@NativeWebViewActivity, "下载失败: ${error ?: "unknown"}", Toast.LENGTH_SHORT).show()
+                showToastIfForeground("下载失败: ${error ?: "unknown"}")
             }
         }
     }
@@ -1746,17 +1703,20 @@ class NativeWebViewActivity : ComponentActivity() {
     }
 
     /**
-     * SPA 路由变化桥：Misskey 使用 pushState 做客户端路由，
-     * 当用户前进到"板块根路径"时清空 WebView 历史栈，
-     * 使返回键表现为"回上级/退出"而非"倒带每一步"。
+     * 路由状态桥：接收 Web 侧（Misskey utility/embedded-shell.ts）经 mainRouter
+     * 主动上报的 `{ fullPath, route }`。仅用于同步 currentUrl（通知/错误页等
+     * 场景需要准确 URL）；返回键行为完全由 WebView 历史决定，
+     * 不再维护任何硬编码路由集合，也不 patch history。
      */
     private inner class AppNavBridge {
         @JavascriptInterface
-        fun onNavigateTo(path: String?) {
-            val p = path?.trim().orEmpty()
-            if (p.isEmpty()) return
+        fun onRouteChange(json: String?) {
+            val obj = runCatching { JSONObject(json.orEmpty()) }.getOrNull() ?: return
+            val fullPath = obj.optString("fullPath", "")
+            if (!fullPath.startsWith("/")) return
+            val route = obj.optString("route", "")
             runOnUiThread {
-                // 同步 currentUrl，避免下拉刷新/通知等场景使用滞后值
+                // 同步 currentUrl，避免刷新/通知等场景使用滞后值
                 val base = currentUrl.let {
                     val u = Uri.parse(it)
                     val scheme = u.scheme ?: "https"
@@ -1764,173 +1724,147 @@ class NativeWebViewActivity : ComponentActivity() {
                     val port = u.port
                     if (port == -1) "$scheme://$host" else "$scheme://$host:$port"
                 }
-                currentUrl = base + (if (p.startsWith("/")) p else "/$p")
+                currentUrl = base + fullPath
+                Log.d(TAG, "Route change: $fullPath route=$route")
             }
         }
     }
 
-    /**
-     * 注入 SPA 路由监听：monkey-patch history.pushState，
-     * 仅在前进导航（pushState）时通知原生层，popstate（后退）不触发。
-     */
-    private fun installSpaNavWatcher() {
-        val js = """
-            (function() {
-              if (window.__LIMINAL_NAV_WATCHER_INSTALLED__) return;
-              window.__LIMINAL_NAV_WATCHER_INSTALLED__ = true;
-              var lastPath = location.pathname;
-              function notify(path) {
-                try {
-                  if (window.AppNav && window.AppNav.onNavigateTo) {
-                    window.AppNav.onNavigateTo(path || '');
-                  }
-                } catch (_) {}
-              }
-              var origPush = history.pushState.bind(history);
-              history.pushState = function(state, title, url) {
-                origPush(state, title, url);
-                var newPath = location.pathname;
-                if (newPath !== lastPath) {
-                  lastPath = newPath;
-                  notify(newPath);
-                }
-              };
-            })();
-        """.trimIndent()
-        webView.evaluateJavascript(js, null)
-    }
-
-    /** 判断路径是否为"板块根"——在这些路径上按返回键视为"退出"而非"回退"。 */
-    private fun isSectionRootPath(path: String): Boolean {
-        val normalized = path.trimEnd('/')
-        return normalized.isEmpty() || normalized in SECTION_ROOT_PATHS
-    }
-
-    /**
-     * WebSocket 状态桥：接收 JS 层上报的 Misskey WS 连接状态（open/close/error）。
-     * 仅用于可观测性日志；常驻模式下保活不再依赖 WebView 的 WS 状态。
-     */
-    private inner class AppWsBridge {
-        @JavascriptInterface
-        fun onState(state: String?, url: String?) {
-            val s = state.orEmpty()
-            wsConnected = (s == "open")
-            Log.i(TAG, "Misskey WebSocket state=$s url=${url.orEmpty()}")
-        }
-    }
-
-    /**
-     * 注入 WebSocket 状态监听：包装 window.WebSocket 构造函数，
-     * 为 Misskey 建立的每条 WS 连接附加 open/close/error 监听并上报原生层。
-     * 幂等：已安装则跳过；页面重载后 JS 上下文重置，onPageFinished 会重新注入。
-     */
-    private fun installWsStateWatcher() {
-        val js = """
-            (function() {
-              if (window.__LIMINAL_WS_WATCHER_INSTALLED__) return;
-              window.__LIMINAL_WS_WATCHER_INSTALLED__ = true;
-              var OrigWS = window.WebSocket;
-              function notify(state, url) {
-                try {
-                  if (window.AppWs && window.AppWs.onState) {
-                    window.AppWs.onState(state, url || '');
-                  }
-                } catch (_) {}
-              }
-              function PatchedWS(url, protocols) {
-                var ws = (protocols === undefined) ? new OrigWS(url) : new OrigWS(url, protocols);
-                try {
-                  ws.addEventListener('open', function() { notify('open', url); });
-                  ws.addEventListener('close', function() { notify('close', url); });
-                  ws.addEventListener('error', function() { notify('error', url); });
-                } catch (_) {}
-                return ws;
-              }
-              PatchedWS.prototype = OrigWS.prototype;
-              // 保持 constructor 恒等（ws.constructor === window.WebSocket），提高包装透明度；
-              // 注：无法修复 class X extends WebSocket 的子类化场景（当前 Misskey 未使用）。
-              PatchedWS.prototype.constructor = PatchedWS;
-              PatchedWS.CONNECTING = OrigWS.CONNECTING;
-              PatchedWS.OPEN = OrigWS.OPEN;
-              PatchedWS.CLOSING = OrigWS.CLOSING;
-              PatchedWS.CLOSED = OrigWS.CLOSED;
-              window.WebSocket = PatchedWS;
-            })();
-        """.trimIndent()
-        webView.evaluateJavascript(js, null)
-    }
-
-    /**
-     * 开启推送：拉起权限设置向导（逐项引导 + 返回验证），
-     * 向导完成后才执行实际启用并回报 Misskey 真实状态。
-     */
+    /** 开启推送前必须完成旧版五项权限向导。 */
     private fun enableNativePushFromBridge() {
         if (pushSetupRunning) return
-        pushSetupRunning = true
-        // 向导页配色跟随站内深浅（而非系统），与当前 Misskey 主题一致。
-        pushSetupLauncher.launch(
-            Intent(this, PermissionSetupActivity::class.java)
-                .putExtra(PermissionSetupActivity.EXTRA_DARK, pageThemeDark),
-        )
+        readMisskeyToken { token ->
+            if (token.isNullOrBlank()) {
+                dispatchNativePushState(registered = false, errorCode = "not_logged_in")
+                return@readMisskeyToken
+            }
+            pushSetupRunning = true
+            pushSetupLauncher.launch(
+                Intent(this, PermissionSetupActivity::class.java)
+                    .putExtra(PermissionSetupActivity.EXTRA_DARK, pageThemeDark),
+            )
+        }
     }
 
-    /** 是否正在运行权限向导，避免重复拉起。 */
-    private var pushSetupRunning = false
+    /** 服务端 enableAppPush 开关同步结果。 */
+    private enum class PushSyncResult {
+        /** 开关写入成功 */
+        SUCCESS,
+        /** 未登录（读不到 token），未发起请求 */
+        NOT_LOGGED_IN,
+        /** 已登录但请求失败（网络/服务端问题） */
+        FAILED,
+    }
 
-    private val pushSetupLauncher =
-        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            pushSetupRunning = false
-            if (result.resultCode == RESULT_OK) {
-                // 向导确认全部权限就绪：执行实际启用（服务端开关 + 常驻推送）
-                startNativePushAndDispatch()
-            } else {
-                // 用户取消或中途退出：回报未启用，前端开关状态回退
-                dispatchNativePushState(registered = false, errorCode = "permission_denied")
-            }
-        }
+    /** 从服务端查询 enableAppPush 的结果。 */
+    private enum class PushServerState {
+        ENABLED,
+        DISABLED,
+        /** 未登录（读不到 token），未发起请求 */
+        NOT_LOGGED_IN,
+        /** 已登录但查询失败（网络/服务端问题） */
+        UNREACHABLE,
+    }
 
     private fun startNativePushAndDispatch() {
-        updateAppPushFlagOnMisskey(true) { updated ->
-            if (updated) {
-                getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, true).apply()
-                ensureNativePushRunning()
-                dispatchNativePushState(registered = true, errorCode = null)
-            } else {
-                dispatchNativePushState(registered = false, errorCode = "push_setup_failed")
+        updateAppPushFlagOnMisskey(true) { result ->
+            when (result) {
+                PushSyncResult.SUCCESS -> {
+                    getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, true).apply()
+                    ensureNativePushRunning()
+                    dispatchNativePushState(registered = true, errorCode = null)
+                }
+                PushSyncResult.NOT_LOGGED_IN ->
+                    dispatchNativePushState(registered = false, errorCode = "not_logged_in")
+                PushSyncResult.FAILED ->
+                    dispatchNativePushState(registered = false, errorCode = "push_setup_failed")
             }
         }
     }
 
     private fun disableNativePushFromBridge() {
         // 先同步服务端开关，成功后再本地停用，避免“已停用但刷新又显示启用”
-        updateAppPushFlagOnMisskey(false) { ok ->
-            if (!ok) {
-                dispatchNativePushState(registered = true, errorCode = "push_setup_failed")
-                return@updateAppPushFlagOnMisskey
+        updateAppPushFlagOnMisskey(false) { result ->
+            when (result) {
+                PushSyncResult.SUCCESS -> {
+                    getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, false).apply()
+                    // 开关关闭：立即停止常驻推送（原生 WS + 前台服务），避免无推送时仍耗电
+                    stopNativePushAll()
+                    dispatchNativePushState(registered = false, errorCode = null)
+                }
+                PushSyncResult.NOT_LOGGED_IN -> {
+                    // 未登录无服务端开关可同步：直接按停用处理
+                    getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, false).apply()
+                    stopNativePushAll()
+                    dispatchNativePushState(registered = false, errorCode = null)
+                }
+                PushSyncResult.FAILED -> {
+                    dispatchNativePushState(registered = true, errorCode = "push_setup_failed")
+                }
             }
-            getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, false).apply()
-            nativePushRestoreAttempted = false
-            // 开关关闭：立即停止常驻推送（原生 WS + 前台服务），避免无推送时仍耗电
-            stopNativePushAll()
-            dispatchNativePushState(registered = false, errorCode = null)
         }
     }
 
     private fun injectNativePushStateFromPrefs() {
-        fetchEnableAppPushFromMisskey { serverEnabled ->
-            // 不做本地兜底：状态以服务端为准；服务端不可达时视为未启用
-            if (serverEnabled == null) {
-                dispatchNativePushState(registered = false, errorCode = "push_setup_failed")
-                return@fetchEnableAppPushFromMisskey
+        fetchEnableAppPushFromMisskey { state ->
+            when (state) {
+                PushServerState.NOT_LOGGED_IN -> {
+                    dispatchNativePushState(registered = false, errorCode = null)
+                }
+                PushServerState.UNREACHABLE -> {
+                    dispatchNativePushState(registered = false, errorCode = "push_setup_failed")
+                }
+                PushServerState.DISABLED -> {
+                    getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, false).apply()
+                    stopNativePushAll()
+                    dispatchNativePushState(registered = false, errorCode = null)
+                }
+                PushServerState.ENABLED -> {
+                    if (!areAllPushPermissionsReady()) {
+                        disablePushForIncompletePermissions()
+                        return@fetchEnableAppPushFromMisskey
+                    }
+                    getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, true).apply()
+                    ensureNativePushRunning()
+                    dispatchNativePushState(registered = true, errorCode = null)
+                }
             }
+        }
+    }
 
-            // 按钮状态只反映服务端 enableAppPush，避免“已启用但刷新回到启用按钮”
-            // 系统通知权限只影响实际投递能力，不应反向覆盖服务端开关显示
-            getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, serverEnabled).apply()
-            // 服务端同步后：对齐常驻推送状态（开启则拉起，关闭则全部停止）
-            if (serverEnabled) ensureNativePushRunning() else stopNativePushAll()
-            val permissionError = if (serverEnabled && !areSystemNotificationsEnabled()) "permission_denied" else null
-            dispatchNativePushState(registered = serverEnabled, errorCode = permissionError)
+    /** 每次启动检查旧版五项权限是否完整。 */
+    private fun areAllPushPermissionsReady(): Boolean {
+        ensureMisskeyChannels(this)
+        KeepAliveService.ensureChannel(this)
+        if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) return false
+        val power = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (!power.isIgnoringBatteryOptimizations(packageName)) return false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val chatReady = manager.getNotificationChannel(CHANNEL_MISSKEY_CHAT)?.importance
+                ?.let { it >= NotificationManager.IMPORTANCE_HIGH } == true
+            val notifyReady = manager.getNotificationChannel(CHANNEL_MISSKEY_NOTIFY)?.importance
+                ?.let { it > NotificationManager.IMPORTANCE_NONE } == true
+            val keepAliveReady = manager.getNotificationChannel(KeepAliveService.CHANNEL_ID)?.importance
+                ?.let { it > NotificationManager.IMPORTANCE_NONE } == true
+            if (!chatReady || !notifyReady || !keepAliveReady) return false
+        }
+        return true
+    }
+
+    /** 权限不完整时同步关闭服务器开关和本地推送，并通知 Web 说明原因。 */
+    private fun disablePushForIncompletePermissions() {
+        if (startupPushDisableRunning) return
+        startupPushDisableRunning = true
+        updateAppPushFlagOnMisskey(false) {
+            startupPushDisableRunning = false
+            getPrefs().edit().putBoolean(PREF_NATIVE_PUSH_ENABLED, false).apply()
+            stopNativePushAll()
+            dispatchNativePushState(registered = false, errorCode = null)
+            webView.evaluateJavascript(
+                "window.dispatchEvent(new CustomEvent('$EVENT_NATIVE_PUSH_ALERT'));",
+                null,
+            )
         }
     }
 
@@ -1944,13 +1878,6 @@ class NativeWebViewActivity : ComponentActivity() {
         webView.evaluateJavascript(js, null)
     }
 
-    private fun dispatchNativePushAlert() {
-        webView.evaluateJavascript(
-            "window.dispatchEvent(new CustomEvent('$EVENT_NATIVE_PUSH_ALERT'));",
-            null,
-        )
-    }
-
     private fun injectLiminalAppInfo() {
         val pkg = packageManager.getPackageInfo(packageName, 0)
         val appLabel = packageManager.getApplicationLabel(applicationInfo).toString()
@@ -1960,24 +1887,10 @@ class NativeWebViewActivity : ComponentActivity() {
             put("buildNumber", PackageInfoCompat.getLongVersionCode(pkg).toString())
             put("packageName", packageName)
             put("platform", "android")
+            put("sdkInt", Build.VERSION.SDK_INT)
         }
         val js = "window.__LIMINAL_APP_INFO__ = $map; window.dispatchEvent(new CustomEvent('liminal-app-info-updated'));"
         webView.evaluateJavascript(js, null)
-    }
-
-    private fun reconcileStartupNotificationPermission() {
-        if (startupPermissionChecked) return
-        startupPermissionChecked = true
-        if (!getPrefs().getBoolean(PREF_NATIVE_PUSH_ENABLED, false)) return
-        if (!areSystemNotificationsEnabled()) {
-            disableNativePushFromBridge()
-            dispatchNativePushAlert()
-            return
-        }
-        if (Build.VERSION.SDK_INT < 33) return
-        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return
-        pendingNotificationPermissionFromStartup = true
-        requestPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 
     private fun areSystemNotificationsEnabled(): Boolean {
@@ -2008,6 +1921,11 @@ class NativeWebViewActivity : ComponentActivity() {
     }
 
     private fun showSystemNotification(title: String, body: String, openPath: String? = null) {
+        // 前台抑制：App 在前台时站内已实时展示通知内容，不重复发系统通知
+        if (LiminalApplication.isAppInForeground()) {
+            Log.i(TAG, "showSystemNotification skipped: app in foreground")
+            return
+        }
         // 以本地 pref 为门控：只有用户明确启用了 App 推送才弹系统通知
         if (!getPrefs().getBoolean(PREF_NATIVE_PUSH_ENABLED, false)) {
             Log.w(TAG, "showSystemNotification skipped: PREF_NATIVE_PUSH_ENABLED is false")
@@ -2030,15 +1948,13 @@ class NativeWebViewActivity : ComponentActivity() {
         val isChat = openPath?.startsWith("/chat") == true
         val channelId = if (isChat) CHANNEL_MISSKEY_CHAT else CHANNEL_MISSKEY_NOTIFY
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            ensureNotificationChannels(nm)
+            ensureMisskeyChannels(this)
         }
 
         val targetUrl = openPath?.takeIf { isSafeMisskeyOpenPath(it) }?.let { absoluteUrlForMisskeyPath(it) } ?: currentUrl
 
-        val openIntent = Intent(this, NativeWebViewActivity::class.java).apply {
-            putExtra(EXTRA_URL, targetUrl)
-            putExtra(EXTRA_UA_MARKER, intent.getStringExtra(EXTRA_UA_MARKER).orEmpty())
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            putExtra("extraMap", JSONObject().put("openUrl", targetUrl).toString())
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         val notificationId = localNotificationSeq++
@@ -2071,28 +1987,11 @@ class NativeWebViewActivity : ComponentActivity() {
         NotificationManagerCompat.from(this).notify(notificationId, builder.build())
     }
 
-    /**
-     * 确保通知渠道就绪（幂等）：私信渠道 HIGH（弹窗+声音+震动）、互动渠道 LOW（静默）。
-     * 注意：渠道创建后重要性只能被用户降、不能被代码升，降级场景由权限向导页引导。
-     */
-    private fun ensureNotificationChannels(nm: NotificationManager) {
-        ensureMisskeyChannels(this)
-    }
-
-    private fun onPageReadyForPushRestore() {
-        // 页面加载完成（含登录/切换账号后）：对齐常驻推送状态。
-        // 每次页面就绪都检查，以覆盖"开启开关时未登录→登录后自动拉起"的边界；
-        // ensureNativePushRunning 幂等，重复调用无副作用。
-        if (!getPrefs().getBoolean(PREF_NATIVE_PUSH_ENABLED, false)) return
-        nativePushRestoreAttempted = true
-        ensureNativePushRunning()
-    }
-
-    private fun updateAppPushFlagOnMisskey(enabled: Boolean, cb: (Boolean) -> Unit) {
+    private fun updateAppPushFlagOnMisskey(enabled: Boolean, cb: (PushSyncResult) -> Unit) {
         val origin = getMisskeyOrigin()
         readMisskeyToken { token ->
             if (token.isNullOrBlank()) {
-                cb(false)
+                cb(PushSyncResult.NOT_LOGGED_IN)
                 return@readMisskeyToken
             }
             ioExecutor.execute {
@@ -2105,7 +2004,9 @@ class NativeWebViewActivity : ComponentActivity() {
                     },
                 )
                 mainHandler.post {
-                    if (!isFinishing && !isDestroyed) cb(result.ok)
+                    if (!isFinishing && !isDestroyed) {
+                        cb(if (result.ok) PushSyncResult.SUCCESS else PushSyncResult.FAILED)
+                    }
                 }
             }
         }
@@ -2129,11 +2030,11 @@ class NativeWebViewActivity : ComponentActivity() {
         }
     }
 
-    private fun fetchEnableAppPushFromMisskey(cb: (Boolean?) -> Unit) {
+    private fun fetchEnableAppPushFromMisskey(cb: (PushServerState) -> Unit) {
         val origin = getMisskeyOrigin()
         readMisskeyToken { token ->
             if (token.isNullOrBlank()) {
-                cb(null)
+                cb(PushServerState.NOT_LOGGED_IN)
                 return@readMisskeyToken
             }
             ioExecutor.execute {
@@ -2146,7 +2047,7 @@ class NativeWebViewActivity : ComponentActivity() {
                 )
                 if (!result.ok) {
                     mainHandler.post {
-                        if (!isFinishing && !isDestroyed) cb(null)
+                        if (!isFinishing && !isDestroyed) cb(PushServerState.UNREACHABLE)
                     }
                     return@execute
                 }
@@ -2154,7 +2055,9 @@ class NativeWebViewActivity : ComponentActivity() {
                     JSONObject(result.body).optBoolean("enableAppPush", false)
                 }.getOrNull()
                 mainHandler.post {
-                    if (!isFinishing && !isDestroyed) cb(enabled)
+                    if (!isFinishing && !isDestroyed) {
+                        cb(if (enabled == true) PushServerState.ENABLED else PushServerState.DISABLED)
+                    }
                 }
             }
         }
@@ -2200,7 +2103,6 @@ class NativeWebViewActivity : ComponentActivity() {
             Configuration.UI_MODE_NIGHT_YES
 
     override fun onPause() {
-        mainHandler.removeCallbacks(refreshChromeColorRunnable)
         // 原生 WS 与前台服务常驻，不随前后台切换启停（避免熄屏/点亮反复启停）；
         // 这里只负责 WebView 自身的暂停/恢复。
         if (isFinishing) {
@@ -2228,9 +2130,8 @@ class NativeWebViewActivity : ComponentActivity() {
         applyPersistentSystemBars()
         // 自愈：若前台服务曾被系统回收但推送开关仍开启，回前台时恢复。
         ensureNativePushRunning()
-        // 先用缓存色立即压回去，再合并恢复/焦点事件后统一从网页校正。
+        // 颜色以缓存值立即恢复；网页主题的实际变化经 AppChrome 桥实时上报，无需轮询。
         applySystemBarColor(lastChromeColor)
-        scheduleChromeColorRefresh(180)
     }
 
     /**
@@ -2306,10 +2207,9 @@ class NativeWebViewActivity : ComponentActivity() {
                 return@readMisskeyToken
             }
             getPrefs().edit().putString(PREF_LAST_MISSKEY_TOKEN, token).apply()
-            if (!nativeWsManager.isRunning()) {
-                Log.i(TAG, "Starting resident native WS")
-                nativeWsManager.start(token, getMisskeyOrigin())
-            }
+            // start 幂等：同 token+origin 直接返回；身份变化（换账号/换实例）时由
+            // manager 内部取消旧连接并按新身份重连，因此这里无条件调用。
+            nativeWsManager.start(token, getMisskeyOrigin())
             // 前台服务可能被系统回收过：补拉一次（幂等）
             if (!keepAliveActive) startWebSocketKeepAlive()
         }
@@ -2326,20 +2226,17 @@ class NativeWebViewActivity : ComponentActivity() {
         if (hasFocus) {
             applyPersistentSystemBars()
             applySystemBarColor(lastChromeColor)
-            scheduleChromeColorRefresh(180)
         }
-    }
-
-    private fun scheduleChromeColorRefresh(delayMs: Long) {
-        mainHandler.removeCallbacks(refreshChromeColorRunnable)
-        mainHandler.postDelayed(refreshChromeColorRunnable, delayMs)
     }
 
     override fun onDestroy() {
         // 全屏视图仍挂着时先退出，避免 DecorView 泄漏与回调悬挂
         exitFullscreenCustomViewIfActive()
-        mainHandler.removeCallbacks(refreshChromeColorRunnable)
         mainHandler.removeCallbacks(applyPendingChromeColorRunnable)
+        // 页面销毁：未决的 WebView 权限请求必须显式拒绝，避免回调悬挂
+        denyPendingWebPermission()
+        pushSetupRunning = false
+        startupPushDisableRunning = false
         // 常驻模式：仅 Activity finish（用户退出 App）时停止推送；
         // 系统回收重建场景不停止，交由 onPause(isFinishing) 处理。
         if (isFinishing) {
@@ -2349,8 +2246,9 @@ class NativeWebViewActivity : ComponentActivity() {
         filePathCallback?.onReceiveValue(null)
         filePathCallback = null
         webView.removeJavascriptInterface("AppNativePush")
+        webView.removeJavascriptInterface("AppChrome")
+        webView.removeJavascriptInterface("AppNav")
         webView.removeJavascriptInterface("AppDownload")
-        webView.removeJavascriptInterface("AppWs")
         webView.stopLoading()
         webView.webChromeClient = WebChromeClient()
         webView.webViewClient = WebViewClient()
@@ -2368,18 +2266,17 @@ class NativeWebViewActivity : ComponentActivity() {
         private const val PREF_LAST_MISSKEY_ORIGIN = "liminal_last_misskey_origin"
         private const val EVENT_NATIVE_PUSH = "liminal-native-push"
         private const val EVENT_NATIVE_PUSH_ALERT = "liminal-native-push-alert"
+        private const val EXIT_CONFIRM_MS = 2000L
+        private const val EXIT_BACK_HINT = "再按一次返回键退出应用"
         private const val TAG = "NativeWebViewActivity"
 
-        /** 两次返回间隔不超过该值则退出 Activity（与 [Snackbar.LENGTH_SHORT] 接近）。 */
-        private const val EXIT_CONFIRM_MS = 2000L
-
-        /** 私信消息渠道：高优先级（弹窗+声音+震动）。供权限向导页共用。 */
+        /** 私信消息渠道：高优先级（弹窗+声音+震动）。供权限向导共用。 */
         const val CHANNEL_MISSKEY_CHAT = "misskey_chat_v2"
 
-        /** 互动通知渠道：低优先级（仅通知栏，不弹窗不震动）。供权限向导页共用。 */
+        /** 互动通知渠道：低优先级（仅通知栏，不弹窗不震动）。供权限向导共用。 */
         const val CHANNEL_MISSKEY_NOTIFY = "misskey_notify_v2"
 
-        /** 确保私信渠道存在（幂等），供 [PermissionSetupActivity] 向导页共用。 */
+        /** 确保私信渠道存在（幂等），供 [PermissionSetupActivity] 权限向导共用。 */
         fun ensureChatChannel(context: Context) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
             val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -2398,7 +2295,7 @@ class NativeWebViewActivity : ComponentActivity() {
             }
         }
 
-        /** 确保互动通知渠道存在（幂等），供 [PermissionSetupActivity] 向导页共用。 */
+        /** 确保互动通知渠道存在（幂等），供 [PermissionSetupActivity] 权限向导共用。 */
         fun ensureNotifyChannel(context: Context) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
             val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -2432,7 +2329,7 @@ class NativeWebViewActivity : ComponentActivity() {
             }
         }
 
-        /** 确保 Misskey 相关渠道全部就绪（遗留清理 + 私信 + 互动），供向导页共用。 */
+        /** 确保 Misskey 相关渠道全部就绪（遗留清理 + 私信 + 互动），供权限向导与启动检查共用。 */
         fun ensureMisskeyChannels(context: Context) {
             cleanupLegacyChannels(context)
             ensureChatChannel(context)
@@ -2441,20 +2338,5 @@ class NativeWebViewActivity : ComponentActivity() {
 
         /** 缓存的 Misskey token：供 WebView 暂停后原生 WS 启动兜底使用。 */
         private const val PREF_LAST_MISSKEY_TOKEN = "liminal_last_misskey_token"
-
-        /** 与 Flutter WebView [MisskeyWebShell] 外壳层提示一致。 */
-        private const val SNACK_EXIT_BACK_HINT = "再次点击返回键退出应用"
-
-        /**
-         * 板块根路径集合：用户前进导航到达这些路径时清空 WebView 历史栈，
-         * 使返回键表现为"回上级/退出"而非逐页倒带。
-         * 路径格式：不含尾部斜杠，如 "/explore"。
-         * "/" (首页) 通过 trimEnd('/') 后为空串单独判断，无需列入。
-         */
-        private val SECTION_ROOT_PATHS = setOf(
-            "/explore",
-            "/notifications",
-            "/messages",
-        )
     }
 }

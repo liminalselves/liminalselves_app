@@ -21,7 +21,7 @@
         <item name="android:windowBackground">@color/splash_background</item>
     </style>
 
-    <!-- 权限向导页专用主题（Android 12+ 深色模式）：仍保持浅色，与主页壳层一致 -->
+    <!-- 推送权限向导专用主题（Android 12+ 深色模式）：仍保持浅色，与主页壳层一致 -->
     <style name="Theme.Liminal.Wizard" parent="@android:style/Theme.Light.NoTitleBar">
         <item name="android:windowBackground">#F7F9F5</item>
         <item name="android:windowDrawsSystemBarBackgrounds">true</item>

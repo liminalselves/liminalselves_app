@@ -4,7 +4,7 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.res.ColorStateList
-import android.graphics.Color
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -16,7 +16,6 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.core.view.WindowInsetsControllerCompat
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -33,9 +32,7 @@ class MainActivity : ComponentActivity() {
         val forceUpdate: Boolean,
         val currentVersion: String,
         val minVersion: String,
-        val latestVersion: String,
         val downloadUrl: String?,
-        val changeLog: String,
     )
 
     private val ioExecutor = Executors.newSingleThreadExecutor()
@@ -43,20 +40,31 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 任务已在运行（NativeWebViewActivity 位于栈中）时的普通重入（部分 ROM 回前台会
+        // 重新投递启动 Intent）：直接退场露出现有页面，不走红屏门控，也不向
+        // NativeWebViewActivity 重发会导致整页刷新的启动 Intent。通知深链带 extraMap，仍走完整流程。
+        if (!isTaskRoot && intent.getStringExtra("extraMap").isNullOrBlank()) {
+            finish()
+            return
+        }
         overridePendingTransition(0, 0)
         showLoadingView()
         checkVersionAndContinue()
     }
 
     private fun showLoadingView() {
-        window.statusBarColor = Color.WHITE
-        window.navigationBarColor = Color.WHITE
+        // 跟随系统深浅色：底色与 LaunchTheme 开屏（@color/splash_background）同源，
+        // 深色模式下门控与开屏均为深色，避免恒白闪变；系统栏图标同步反转。
+        val dark = isSystemNightMode()
+        val backgroundColor = getColor(R.color.splash_background)
+        window.statusBarColor = backgroundColor
+        window.navigationBarColor = backgroundColor
         WindowInsetsControllerCompat(window, window.decorView).apply {
-            isAppearanceLightStatusBars = true
-            isAppearanceLightNavigationBars = true
+            isAppearanceLightStatusBars = !dark
+            isAppearanceLightNavigationBars = !dark
         }
         val root = FrameLayout(this).apply {
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(backgroundColor)
         }
         val loadingIndicator = ProgressBar(
             this,
@@ -151,8 +159,8 @@ class MainActivity : ComponentActivity() {
         when {
             policy == null -> launchNativeWebView()
             policy.forceUpdate -> showForceUpdateDialog(policy)
-            compareVersions(policy.latestVersion, policy.currentVersion) > 0 ->
-                showOptionalUpdateDialog(policy)
+            // 启动门控只处理“低于最低版本”的阻断；可选更新统一留在 Misskey「应用」设置页，
+            // 避免冷启动弹窗与站内更新入口重复打扰。
             else -> launchNativeWebView()
         }
     }
@@ -171,25 +179,16 @@ class MainActivity : ComponentActivity() {
                 ?.optString("minRequiredVersion", "")
                 ?.trim()
                 ?: nativeInfo.optString("minRequiredAppVersion", "").trim()
-            val latest = release
-                ?.optString("version", "")
-                ?.trim()
-                ?.takeIf { it.isNotEmpty() }
-                ?: nativeInfo.optString("latestAndroidVersion", "").trim()
             val download = (release
                 ?.optString("downloadUrl", "")
                 ?: nativeInfo.optString("androidDownloadUrl", ""))
                 .trim()
                 .takeIf { it.isNotEmpty() }
-            val changeLogEntries = release?.optJSONArray("changelog")
-                ?: nativeInfo.optJSONArray("changelog")
             UpdatePolicy(
                 forceUpdate = minimum.isNotEmpty() && compareVersions(current, minimum) < 0,
                 currentVersion = current,
                 minVersion = minimum,
-                latestVersion = latest,
                 downloadUrl = download,
-                changeLog = formatChangeLog(changeLogEntries, current, latest),
             )
         }.getOrNull()
     }
@@ -213,24 +212,6 @@ class MainActivity : ComponentActivity() {
         return selected
     }
 
-    private fun formatChangeLog(entries: JSONArray?, current: String, latest: String): String {
-        if (entries == null) return "本次未配置更新内容。"
-        val selected = mutableListOf<Pair<String, String>>()
-        for (index in 0 until entries.length()) {
-            val item = entries.optJSONObject(index) ?: continue
-            val version = item.optString("version", "").trim()
-            if (version.isEmpty()) continue
-            if (compareVersions(version, current) <= 0) continue
-            if (latest.isNotEmpty() && compareVersions(version, latest) > 0) continue
-            selected += version to item.optString("content", "").trim()
-        }
-        selected.sortWith { left, right -> compareVersions(right.first, left.first) }
-        if (selected.isEmpty()) return "本次未配置更新内容。"
-        return selected.joinToString("\n\n") { (version, content) ->
-            if (content.isEmpty()) version else "$version\n$content"
-        }
-    }
-
     private fun compareVersions(left: String, right: String): Int {
         val a = left.substringBefore('+').substringBefore('-').split('.')
         val b = right.substringBefore('+').substringBefore('-').split('.')
@@ -241,31 +222,6 @@ class MainActivity : ComponentActivity() {
             if (av != bv) return av.compareTo(bv)
         }
         return 0
-    }
-
-    private fun showOptionalUpdateDialog(policy: UpdatePolicy) {
-        val context = ContextThemeWrapper(this, R.style.Theme_Liminal_Dialog_Host)
-        val message = buildString {
-            append("服务器已发布较新的客户端版本，建议更新以获得最佳体验。\n\n")
-            append("最新：${policy.latestVersion}\n")
-            append("当前：${policy.currentVersion}\n\n")
-            append(policy.changeLog)
-        }
-        val dialog = MaterialAlertDialogBuilder(context)
-            .setTitle("发现新版本")
-            .setMessage(message)
-            .setNegativeButton("稍后") { _, _ -> launchNativeWebView() }
-            .setPositiveButton("前往更新", null)
-            .setOnCancelListener { launchNativeWebView() }
-            .create()
-        dialog.setOnShowListener {
-            val updateButton = dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)
-            updateButton.isEnabled = !policy.downloadUrl.isNullOrBlank()
-            updateButton.setOnClickListener {
-                policy.downloadUrl?.let(::openUpdateUrl)
-            }
-        }
-        dialog.show()
     }
 
     private fun showForceUpdateDialog(policy: UpdatePolicy) {
@@ -310,6 +266,7 @@ class MainActivity : ComponentActivity() {
         if (destinationOpened || isFinishing || isDestroyed) return
         destinationOpened = true
         val next = Intent(this, NativeWebViewActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
             val extraMap = intent.getStringExtra("extraMap")
             if (extraMap.isNullOrBlank()) {
                 putExtra(NativeWebViewActivity.EXTRA_URL, BuildConfig.MISSKEY_URL)
@@ -326,6 +283,11 @@ class MainActivity : ComponentActivity() {
 
     private fun dp(value: Int): Int =
         (value * resources.displayMetrics.density).toInt().coerceAtLeast(1)
+
+    /** 系统是否处于深色模式（门控停留时间极短，随启动配置求值一次即可）。 */
+    private fun isSystemNightMode(): Boolean =
+        (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
 
     override fun onDestroy() {
         ioExecutor.shutdownNow()

@@ -31,7 +31,7 @@
         <item name="android:windowLightNavigationBar" tools:targetApi="o_mr1">true</item>
     </style>
 
-    <!-- 权限向导页专用主题：浅色背景 + 透明系统栏 + 深色图标，
+    <!-- 推送权限向导专用主题：浅色背景 + 透明系统栏 + 深色图标，
          与主页 WebView 的浅色系统栏保持一致，避免进入向导页时上下栏突变深。
          系统栏颜色必须在主题中声明（各 values 变体各自定义），
          仅靠代码设置在高版本 Android/部分 ROM 上不可靠。 -->
@@ -63,7 +63,7 @@
         <item name="colorOnPrimary">#0B1B33</item>
     </style>
 
-    <!-- 权限向导暗色变体：由 PermissionSetupActivity 按站内深浅状态在代码中 setTheme 选择 -->
+    <!-- 推送权限向导暗色变体：由 PermissionSetupActivity 按站内深浅状态在代码中 setTheme 选择 -->
     <style name="Theme.Liminal.Wizard.Dark" parent="@android:style/Theme.NoTitleBar">
         <item name="android:windowBackground">#15171C</item>
         <item name="android:windowDrawsSystemBarBackgrounds">true</item>

@@ -44,8 +44,14 @@ class NativeWsManager(
     private var webSocket: WebSocket? = null
     private val running = AtomicBoolean(false)
     private val reconnectDelay = AtomicInteger(INITIAL_RECONNECT_DELAY_MS.toInt())
-    private var token: String = ""
-    private var origin: String = ""
+    @Volatile private var token: String = ""
+    @Volatile private var origin: String = ""
+    /**
+     * 当前连接代数：start（身份变化）/stop 时递增。
+     * 旧 socket 的回调携带建立时的代数，过期即整体失效，
+     * 杜绝旧连接的 onClosed/onFailure 触发新一轮重连的竞态。
+     */
+    @Volatile private var generation = 0L
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val heartbeatRunnable = object : Runnable {
@@ -65,14 +71,23 @@ class NativeWsManager(
     }
 
     /**
-     * 启动原生 WS 连接。
+     * 启动原生 WS 连接（身份感知）：
+     * - 同一 token+origin 且已在运行：幂等，直接返回；
+     * - token/origin 变化（换账号/换实例）：取消旧连接与全部待执行回调，
+     *   立即按新身份重建连接（旧 socket 回调因代数失效，不会触发重连竞态）。
      * @param token 用户认证 token
      * @param origin Misskey 实例 origin（如 https://misskey.example.com）
      */
     fun start(token: String, origin: String) {
-        if (running.getAndSet(true)) {
-            Log.d(TAG, "Already running, skip start")
+        if (running.get() && token == this.token && origin == this.origin) {
+            Log.d(TAG, "Already running with same identity, start is idempotent")
             return
+        }
+        if (running.get()) {
+            Log.i(TAG, "Identity changed, restarting native WS connection")
+            cancelCurrentConnection()
+        } else {
+            running.set(true)
         }
         this.token = token
         this.origin = origin
@@ -85,13 +100,19 @@ class NativeWsManager(
     fun stop() {
         if (!running.getAndSet(false)) return
         Log.i(TAG, "Stopping native WS connection")
-        mainHandler.removeCallbacks(heartbeatRunnable)
-        mainHandler.removeCallbacks(reconnectRunnable)
-        webSocket?.close(1000, "App resumed foreground")
-        webSocket = null
+        cancelCurrentConnection()
     }
 
     fun isRunning(): Boolean = running.get()
+
+    /** 使当前 socket、心跳与待重连回调全部失效（不改变 running 状态）。 */
+    private fun cancelCurrentConnection() {
+        generation++
+        mainHandler.removeCallbacks(heartbeatRunnable)
+        mainHandler.removeCallbacks(reconnectRunnable)
+        webSocket?.close(1000, "stopped or identity changed")
+        webSocket = null
+    }
 
     private fun connect() {
         if (!running.get()) return
@@ -100,8 +121,17 @@ class NativeWsManager(
         Log.d(TAG, "Connecting to $wsOrigin/streaming")
 
         val request = Request.Builder().url(url).build()
+        val myGeneration = generation
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
+            /** 回调所属 socket 已过期（stop/重启/被新连接替换）时整体失效。 */
+            private fun isStale(ws: WebSocket): Boolean {
+                val stale = !running.get() || generation != myGeneration || webSocket !== ws
+                if (stale) runCatching { ws.close(1000, "stale callback") }
+                return stale
+            }
+
+            override fun onOpen(ws: WebSocket, response: Response) {
+                if (isStale(ws)) return
                 Log.i(TAG, "WS connected, subscribing to main channel")
                 reconnectDelay.set(INITIAL_RECONNECT_DELAY_MS.toInt())
                 // 订阅 main channel
@@ -112,22 +142,26 @@ class NativeWsManager(
                         put("id", CHANNEL_ID)
                     })
                 }
-                webSocket.send(subscribe.toString())
-                // 启动心跳
+                ws.send(subscribe.toString())
+                // 启动心跳（先清掉可能残留的调度，防止重复心跳）
+                mainHandler.removeCallbacks(heartbeatRunnable)
                 mainHandler.postDelayed(heartbeatRunnable, HEARTBEAT_INTERVAL_MS)
             }
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
+            override fun onMessage(ws: WebSocket, text: String) {
+                if (isStale(ws)) return
                 handleMessage(text)
             }
 
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+                if (isStale(ws)) return
                 Log.w(TAG, "WS closed: code=$code, reason=$reason")
                 mainHandler.removeCallbacks(heartbeatRunnable)
                 scheduleReconnect()
             }
 
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                if (isStale(ws)) return
                 Log.w(TAG, "WS failure: ${t.message}")
                 mainHandler.removeCallbacks(heartbeatRunnable)
                 scheduleReconnect()

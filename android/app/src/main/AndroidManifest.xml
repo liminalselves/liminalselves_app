@@ -2,6 +2,8 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- WebView 文件选择与 `<input capture>` 拍照 -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- WebView RESOURCE_AUDIO_CAPTURE（getUserMedia 语音）映射的运行时权限 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Android 9 及以下下载文件需要写外部存储；API 29+ 使用 MediaStore/应用私有目录无需此权限 -->
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
@@ -48,8 +50,7 @@
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|locale|layoutDirection|fontScale|density"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize" />
-        <!-- 推送权限设置向导：逐项引导开启通知/电池豁免/悬浮通知。
-             使用专用主题（各 values 变体均有定义），保证系统栏与主页壳层一致的浅色。 -->
+        <!-- 推送权限设置向导：逐项引导开启通知/电池豁免/通知渠道，全部完成后才允许启用 App 推送。 -->
         <activity
             android:name=".PermissionSetupActivity"
             android:exported="false"
