@@ -16,6 +16,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.core.view.WindowInsetsControllerCompat
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -32,7 +33,9 @@ class MainActivity : ComponentActivity() {
         val forceUpdate: Boolean,
         val currentVersion: String,
         val minVersion: String,
+        val latestVersion: String,
         val downloadUrl: String?,
+        val changeLog: String,
     )
 
     private val ioExecutor = Executors.newSingleThreadExecutor()
@@ -82,14 +85,14 @@ class MainActivity : ComponentActivity() {
 
     private fun checkVersionAndContinue() {
         val prefs = getSharedPreferences(PREFS_UPDATE_GATE, Context.MODE_PRIVATE)
-        val cachedJson = prefs.getString(KEY_META_JSON, null)
+        val cacheKey = "$KEY_META_JSON:${Uri.parse(BuildConfig.MISSKEY_URL).normalizeScheme()}"
+        val cachedJson = prefs.getString(cacheKey, null)
 
-        // stale-while-revalidate：有缓存时立即放行（保证启动速度），同时后台刷新缓存供下次启动使用；
-        // 无缓存（首次启动）才同步等待网络请求。这样既避免每次冷启动都阻塞于网络，
-        // 又能让版本更新提示在下一次启动时及时生效（而非旧 3 小时缓存的长时间滞后）。
+        // 缓存按构建注入的实例地址隔离。覆盖安装使用 -PmisskeyUrl 的开发包时，
+        // 不能将正式实例的版本策略当成当前实例的策略。
         if (!cachedJson.isNullOrBlank()) {
             applyUpdatePolicy(cachedJson)
-            refreshMetaInBackground(prefs)
+            refreshMetaInBackground(prefs, cacheKey)
             return
         }
 
@@ -97,29 +100,30 @@ class MainActivity : ComponentActivity() {
             val freshJson = fetchMeta()
             if (freshJson != null) {
                 prefs.edit()
-                    .putString(KEY_META_JSON, freshJson)
+                    .putString(cacheKey, freshJson)
                     .putLong(KEY_META_SAVED_AT, System.currentTimeMillis())
                     .apply()
             }
-            val usableJson = freshJson ?: cachedJson
             runOnUiThread {
                 if (isFinishing || isDestroyed) return@runOnUiThread
-                if (usableJson.isNullOrBlank()) {
+                if (freshJson.isNullOrBlank()) {
                     launchNativeWebView()
                 } else {
-                    applyUpdatePolicy(usableJson)
+                    applyUpdatePolicy(freshJson)
                 }
             }
         }
     }
 
-    /** 后台刷新 meta 缓存（不阻塞当前启动），供下一次启动时及时获得最新版本信息。 */
-    private fun refreshMetaInBackground(prefs: android.content.SharedPreferences) {
+    private fun refreshMetaInBackground(
+        prefs: android.content.SharedPreferences,
+        cacheKey: String,
+    ) {
         ioExecutor.execute {
             val freshJson = fetchMeta()
             if (freshJson != null) {
                 prefs.edit()
-                    .putString(KEY_META_JSON, freshJson)
+                    .putString(cacheKey, freshJson)
                     .putLong(KEY_META_SAVED_AT, System.currentTimeMillis())
                     .apply()
             }
@@ -159,8 +163,8 @@ class MainActivity : ComponentActivity() {
         when {
             policy == null -> launchNativeWebView()
             policy.forceUpdate -> showForceUpdateDialog(policy)
-            // 启动门控只处理“低于最低版本”的阻断；可选更新统一留在 Misskey「应用」设置页，
-            // 避免冷启动弹窗与站内更新入口重复打扰。
+            compareVersions(policy.latestVersion, policy.currentVersion) > 0 ->
+                showOptionalUpdateDialog(policy)
             else -> launchNativeWebView()
         }
     }
@@ -178,17 +182,28 @@ class MainActivity : ComponentActivity() {
             val minimum = release
                 ?.optString("minRequiredVersion", "")
                 ?.trim()
+                ?.takeIf { it.isNotEmpty() }
                 ?: nativeInfo.optString("minRequiredAppVersion", "").trim()
+            val latest = release
+                ?.optString("version", "")
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: nativeInfo.optString("latestAndroidVersion", "").trim()
             val download = (release
                 ?.optString("downloadUrl", "")
+                ?.takeIf { it.isNotBlank() }
                 ?: nativeInfo.optString("androidDownloadUrl", ""))
                 .trim()
                 .takeIf { it.isNotEmpty() }
+            val changeLogEntries = release?.optJSONArray("changelog")
+                ?: nativeInfo.optJSONArray("changelog")
             UpdatePolicy(
                 forceUpdate = minimum.isNotEmpty() && compareVersions(current, minimum) < 0,
                 currentVersion = current,
                 minVersion = minimum,
+                latestVersion = latest,
                 downloadUrl = download,
+                changeLog = formatChangeLog(changeLogEntries, current, latest),
             )
         }.getOrNull()
     }
@@ -212,6 +227,24 @@ class MainActivity : ComponentActivity() {
         return selected
     }
 
+    private fun formatChangeLog(entries: JSONArray?, current: String, latest: String): String {
+        if (entries == null) return "本次未配置更新内容。"
+        val selected = mutableListOf<Pair<String, String>>()
+        for (index in 0 until entries.length()) {
+            val item = entries.optJSONObject(index) ?: continue
+            val version = item.optString("version", "").trim()
+            if (version.isEmpty()) continue
+            if (compareVersions(version, current) <= 0) continue
+            if (latest.isNotEmpty() && compareVersions(version, latest) > 0) continue
+            selected += version to item.optString("content", "").trim()
+        }
+        selected.sortWith { left, right -> compareVersions(right.first, left.first) }
+        if (selected.isEmpty()) return "本次未配置更新内容。"
+        return selected.joinToString("\n\n") { (version, content) ->
+            if (content.isEmpty()) version else "$version\n$content"
+        }
+    }
+
     private fun compareVersions(left: String, right: String): Int {
         val a = left.substringBefore('+').substringBefore('-').split('.')
         val b = right.substringBefore('+').substringBefore('-').split('.')
@@ -222,6 +255,31 @@ class MainActivity : ComponentActivity() {
             if (av != bv) return av.compareTo(bv)
         }
         return 0
+    }
+
+    private fun showOptionalUpdateDialog(policy: UpdatePolicy) {
+        val context = ContextThemeWrapper(this, R.style.Theme_Liminal_Dialog_Host)
+        val message = buildString {
+            append("服务器已发布较新的客户端版本，建议更新以获得最佳体验。\n\n")
+            append("最新：${policy.latestVersion}\n")
+            append("当前：${policy.currentVersion}\n\n")
+            append(policy.changeLog)
+        }
+        val dialog = MaterialAlertDialogBuilder(context)
+            .setTitle("发现新版本")
+            .setMessage(message)
+            .setNegativeButton("稍后") { _, _ -> launchNativeWebView() }
+            .setPositiveButton("前往更新", null)
+            .setOnCancelListener { launchNativeWebView() }
+            .create()
+        dialog.setOnShowListener {
+            val updateButton = dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)
+            updateButton.isEnabled = !policy.downloadUrl.isNullOrBlank()
+            updateButton.setOnClickListener {
+                policy.downloadUrl?.let(::openUpdateUrl)
+            }
+        }
+        dialog.show()
     }
 
     private fun showForceUpdateDialog(policy: UpdatePolicy) {

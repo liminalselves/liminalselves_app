@@ -1,6 +1,6 @@
 # Misskey 嵌入式壳（App WebView）跨仓库 UX 协议
 
-> 版本：v5（2026-09-27）
+> 版本：v6（2026-09-27）
 >
 > 壳层：`liminalselves/android/app/src/main/kotlin/top/liminalselves/app/`
 > Web：`misskey/packages/frontend/src/`
@@ -13,6 +13,12 @@
 - Android 壳负责 WebView 生命周期、系统通知、后台原生 WebSocket、文件能力、系统栏、权限向导和下载落盘。
 - 不修改 Misskey 现有底栏、抽屉项目、导航目标和信息架构。
 - Android 原生 WS 只负责后台系统通知，不能替代 Misskey Web Streaming。
+
+### 1.1 启动版本检查
+
+- 正常冷启动时，`MainActivity` 必须向 `BuildConfig.MISSKEY_URL` 对应的 `/api/meta` 读取版本策略；`-PmisskeyUrl=...` 同时决定 WebView 地址和版本检查地址。
+- 同一实例已有缓存时可先按缓存快速进入并后台刷新；首次启动或切换构建注入的实例地址时必须等待该实例返回，开发包与正式包不得互用策略缓存。
+- 当前版本低于 `minRequiredAppVersion` 时阻断进入 WebView；未低于最低版本但低于 `latestAndroidVersion` 时，启动时显示可关闭的更新提示及下载入口。
 
 ## 2. Web → Android 桥
 
@@ -108,6 +114,8 @@ Android → Web：
 
 ## 10. 验收清单
 
+- [ ] 使用 `-PmisskeyUrl=...` 构建后，启动版本检查请求同一实例的 `/api/meta`；开发与正式实例缓存不互用；
+- [ ] 当前版本低于服务器最低版本时不可进入 WebView；仅低于最新版本时出现可关闭的启动更新提示；
 - [ ] 本机和公开隧道 `/streaming` WebSocket 均 OPEN；
 - [ ] 壳内即使关闭 realtimeMode，通知、私信、智能体消息、未读数、账号更新、公告仍实时更新；
 - [ ] 打开抽屉时不出现上下大块模糊遮罩；
