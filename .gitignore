@@ -1,6 +1,8 @@
 # Editor / local tooling
 .cursor/
 .vscode/
+.zcode/
+.zcodeignore
 lib/misskey.code-workspace
 
 # Miscellaneous

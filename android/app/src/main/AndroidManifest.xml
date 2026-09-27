@@ -11,7 +11,7 @@
     <uses-feature
         android:name="android.hardware.camera"
         android:required="false" />
-    <!-- Android 13+ 通知权限（阿里云推送 SDK 3.8.4+ 会处理，此处显式声明） -->
+    <!-- Android 13+ 通知权限：原生 WebSocket 推送的系统通知需要 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- WebSocket 后台保活：前台服务 + CPU/网络锁，维持 WebView 中的长连接 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

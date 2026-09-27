@@ -17,9 +17,12 @@ Misskey 移动客户端工程，包名与 iOS Bundle ID 均为 **`top.liminalsel
 ## Android 构建（原生，不经过 Flutter 工具链）
 
 ```powershell
+# 推荐：经辅助脚本构建（自动定位 JDK 后调用 android/gradlew.bat）
+.\scripts\gradle-with-jdk.ps1 assembleRelease -PmisskeyUrl=http://47.79.85.42:8888/
+
+# 或手动指定 JDK 后直接调用 gradlew
 $env:JAVA_HOME="C:\Program Files\Eclipse Adoptium\jdk-21.0.11.10-hotspot"
-cd android
-.\gradlew.bat assembleRelease -PmisskeyUrl=http://47.79.85.42:8888/
+.\android\gradlew.bat assembleRelease -PmisskeyUrl=http://47.79.85.42:8888/
 ```
 
 产物位于 `build/app/outputs/apk/release/app-release.apk`（约 2 MB）。
@@ -27,8 +30,7 @@ cd android
 发布前执行：
 
 ```powershell
-cd android
-.\gradlew.bat lintRelease
+.\scripts\gradle-with-jdk.ps1 lintRelease
 ```
 
 其他平台的 Flutter 检查：
