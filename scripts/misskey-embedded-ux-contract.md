@@ -10,7 +10,7 @@
 ## 1. 职责边界
 
 - Misskey 负责站内导航、Streaming 实时状态、抽屉、时间线刷新、业务弹层和主题。
-- Android 壳负责 WebView 生命周期、系统通知、后台原生 WebSocket、文件能力、系统栏、权限向导和下载落盘。
+- Android 壳负责 WebView 生命周期、顶缘下拉整页重载、系统通知、后台原生 WebSocket、文件能力、系统栏、权限向导和下载落盘；Misskey 仍负责站内时间线刷新。
 - 不修改 Misskey 现有底栏、抽屉项目、导航目标和信息架构。
 - Android 原生 WS 只负责后台系统通知，不能替代 Misskey Web Streaming。
 

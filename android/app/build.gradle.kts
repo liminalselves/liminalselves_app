@@ -92,6 +92,7 @@ tasks.withType<JavaCompile>().configureEach {
 }
 
 dependencies {
+    implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
     // 外链确认对话框：Material 3，与壳层风格一致。
     implementation("com.google.android.material:material:1.12.0")
     // 原生 WebSocket：后台保活时绕过 WebView JS 节流，独立接收 Misskey Streaming 消息

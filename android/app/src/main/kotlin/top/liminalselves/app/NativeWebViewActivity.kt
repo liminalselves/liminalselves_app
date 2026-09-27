@@ -33,7 +33,9 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.JavascriptInterface
@@ -67,6 +69,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import android.view.ContextThemeWrapper
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import org.json.JSONObject
@@ -82,7 +85,7 @@ class NativeWebViewActivity : ComponentActivity() {
         val statusCode: Int,
         val body: String,
     )
-    private lateinit var rootContainer: FrameLayout
+    private lateinit var rootContainer: TopEdgeSwipeRefreshLayout
     private lateinit var webView: WebView
     private lateinit var progressBar: ProgressBar
     private lateinit var errorOverlay: View
@@ -124,6 +127,7 @@ class NativeWebViewActivity : ComponentActivity() {
 
     /** 后台期间保存的 WebView 导航历史：renderer 被系统回收重建时恢复返回栈。 */
     private var savedWebViewState: Bundle? = null
+    private val topPullHotZoneDp = 84
 
     // ─── HTML5 全屏（视频等 Fullscreen API → WebChromeClient.onShowCustomView）───
     /** 当前处于全屏的 WebView 自定义视图（如私信视频点全屏时由引擎提供）。 */
@@ -610,11 +614,11 @@ class NativeWebViewActivity : ComponentActivity() {
                 // 服务端初始 meta theme-color 是实例强调色，不能拿来染系统栏；
                 // 页面加载阶段保持壳层深浅底色，等 Misskey theme.ts 应用真实主题后由 AppChrome 上报。
                 applySystemBarColor(defaultChromeColor)
-                // 页面导航的刷新反馈只保留顶部进度条（onProgressChanged）；
-                // 原生刷新圈已随页面级下拉刷新一起移除。
+                rootContainer.isRefreshing = true
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
+                rootContainer.isRefreshing = false
                 if (loadFailedForCurrentNavigation) return
                 persistTrustedMisskeyOrigin(url)
                 injectLiminalAppInfo()
@@ -669,6 +673,7 @@ class NativeWebViewActivity : ComponentActivity() {
                     null
                 }
                 Log.w(TAG, "WebView render process gone. didCrash=$didCrash")
+                rootContainer.isRefreshing = false
                 view?.destroy()
                 recreateWebViewAndReload()
                 return true
@@ -799,9 +804,23 @@ class NativeWebViewActivity : ComponentActivity() {
         // Theme.Light 保持壳层浅色不变。系统深浅色切换会触发 Activity 重建，
         // 届时以新配置重新解析该主题，站内 matchMedia 即得到正确结果。
         webView = WebView(ContextThemeWrapper(this, R.style.Theme_Liminal_WebView))
-        // 原生页面级下拉刷新已移除：刷新手势完全交由 Misskey Web 自身的
-        // pull-to-refresh 处理，壳层只在主文档加载期间展示顶部进度条。
-        rootContainer = FrameLayout(this).apply {
+        rootContainer = TopEdgeSwipeRefreshLayout(this).apply {
+            hotZonePx = dp(topPullHotZoneDp)
+            statusBarInsetProvider = {
+                ViewCompat.getRootWindowInsets(window.decorView)
+                    ?.getInsets(WindowInsetsCompat.Type.statusBars())
+                    ?.top ?: 0
+            }
+            canChildScrollUpProvider = { webView.canScrollVertically(-1) }
+            setColorSchemeColors(accentColor, accentColorDark)
+            setProgressViewOffset(false, dp(18), dp(62))
+            setOnRefreshListener {
+                if (showingErrorPage) {
+                    retryFromErrorPage()
+                } else {
+                    webView.reload()
+                }
+            }
             setBackgroundColor(defaultChromeColor)
         }
         // 透明状态栏下，把安全区显式变成顶部 padding，避免刘海/状态栏遮挡内容。
@@ -860,8 +879,11 @@ class NativeWebViewActivity : ComponentActivity() {
         setContentView(rootContainer)
     }
 
-    /** 壳层随站内深浅变化的调色板应用：顶部进度条轨道。 */
+    /** 壳层随站内深浅变化的调色板应用：刷新指示器圆底与顶部进度条轨道。 */
     private fun applyShellPalette() {
+        rootContainer.setProgressBackgroundColorSchemeColor(
+            if (pageThemeDark) Color.parseColor("#22262E") else Color.WHITE,
+        )
         progressBar.progressBackgroundTintList = ColorStateList.valueOf(
             if (pageThemeDark) Color.parseColor("#1F3A66") else progressBarTrackColor,
         )
@@ -1074,6 +1096,65 @@ class NativeWebViewActivity : ComponentActivity() {
         }
     }
 
+    private class TopEdgeSwipeRefreshLayout(context: Context) : SwipeRefreshLayout(context) {
+        var hotZonePx = 0
+        var statusBarInsetProvider: (() -> Int)? = null
+        var canChildScrollUpProvider: (() -> Boolean)? = null
+
+        private var gestureEligible = false
+        private var downX = 0f
+        private var downY = 0f
+        private var directionLock = 0
+        private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+        private val verticalTriggerSlop = (touchSlop * 1.8f).toInt()
+
+        override fun onInterceptTouchEvent(event: MotionEvent): Boolean {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    val statusBarTop = statusBarInsetProvider?.invoke() ?: 0
+                    val startsAtTop = event.y <= statusBarTop + hotZonePx
+                    val canScrollUp = canChildScrollUpProvider?.invoke() ?: true
+                    gestureEligible = startsAtTop && !canScrollUp
+                    downX = event.x
+                    downY = event.y
+                    directionLock = 0
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    if (gestureEligible && directionLock == 0) {
+                        val dx = kotlin.math.abs(event.x - downX)
+                        val dy = kotlin.math.abs(event.y - downY)
+                        if (dx <= touchSlop && dy <= verticalTriggerSlop) return false
+
+                        directionLock = if (dy > dx && dy > 0f) 1 else -1
+                        if (directionLock == -1) gestureEligible = false
+                    }
+                }
+
+                MotionEvent.ACTION_UP,
+                MotionEvent.ACTION_CANCEL -> resetGesture()
+            }
+            if (!gestureEligible || directionLock == -1) return false
+            return super.onInterceptTouchEvent(event)
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            if (!gestureEligible && !isRefreshing) return false
+            val handled = super.onTouchEvent(event)
+            if (event.actionMasked == MotionEvent.ACTION_UP ||
+                event.actionMasked == MotionEvent.ACTION_CANCEL
+            ) {
+                resetGesture()
+            }
+            return handled
+        }
+
+        private fun resetGesture() {
+            gestureEligible = false
+            directionLock = 0
+        }
+    }
+
     private fun recreateWebViewAndReload() {
         // 旧 WebView 即将销毁：未决权限请求一并拒绝
         denyPendingWebPermission()
@@ -1260,6 +1341,7 @@ class NativeWebViewActivity : ComponentActivity() {
         loadFailedForCurrentNavigation = true
         showingErrorPage = true
         currentUrl = failingUrl
+        rootContainer.isRefreshing = false
         progressBar.visibility = View.GONE
         view?.stopLoading()
         webView.visibility = View.INVISIBLE
@@ -1305,7 +1387,7 @@ class NativeWebViewActivity : ComponentActivity() {
         hideLoadErrorPage()
         loadFailedForCurrentNavigation = false
         webView.visibility = View.VISIBLE
-        // 唯一的初始主文档进度反馈：顶部水平进度条（后续由 onProgressChanged 驱动）。
+        rootContainer.isRefreshing = true
         progressBar.progress = 5
         progressBar.visibility = View.VISIBLE
         webView.stopLoading()
