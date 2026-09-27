@@ -105,6 +105,7 @@ Android → Web：
 - 下载完成：不自动打开文件；前台单条 Toast「已保存到 Download/: <文件名>」；后台发静默系统通知（复用互动通知渠道），点击通知打开文件。
 - HTTP 下载保留 DownloadManager 下载中进度通知。
 - `about:blank` 等内部协议不触发离站确认。
+- 官方 `liminalselves.top` 域及 `-PmisskeyUrl=...` 注入实例的同源地址（协议、主机、端口均一致）在 WebView 内打开；其余 HTTP(S) 地址先确认再交给系统浏览器。
 - 外链无法打开时必须显示错误。
 
 ## 9a. 视图缩放
@@ -114,7 +115,7 @@ Android → Web：
 
 ## 10. 验收清单
 
-- [ ] 使用 `-PmisskeyUrl=...` 构建后，启动版本检查请求同一实例的 `/api/meta`；开发与正式实例缓存不互用；
+- [ ] 使用 `-PmisskeyUrl=...` 构建后，启动版本检查请求同一实例的 `/api/meta`；开发与正式实例缓存不互用；该实例的同源站内跳转和 `window.open()` 不弹离站确认；
 - [ ] 当前版本低于服务器最低版本时不可进入 WebView；仅低于最新版本时出现可关闭的启动更新提示；
 - [ ] 本机和公开隧道 `/streaming` WebSocket 均 OPEN；
 - [ ] 壳内即使关闭 realtimeMode，通知、私信、智能体消息、未读数、账号更新、公告仍实时更新；

@@ -722,7 +722,7 @@ class NativeWebViewActivity : ComponentActivity() {
             /**
              * 拦截 window.open()：Misskey 前端更新弹窗等场景会用 window.open 打开链接，
              * WebView 默认不支持多窗口会静默丢弃。这里提取目标 URL：
-             * 站内域名（*.liminalselves.top）在当前 WebView 内加载；站外域名弹确认后在系统浏览器打开。
+             * 官方域名及构建注入的实例同源地址在当前 WebView 内加载；其余地址弹确认后在系统浏览器打开。
              */
             override fun onCreateWindow(
                 view: WebView?,
@@ -1273,6 +1273,26 @@ class NativeWebViewActivity : ComponentActivity() {
             R.style.Theme_Liminal_Dialog_Host_Light
         }
 
+    /** 构建注入的实例按同源匹配，避免同一主机的其他端口被误当作站内页面。 */
+    private fun isInternalMisskeyUrl(uri: Uri): Boolean {
+        val scheme = uri.scheme?.lowercase() ?: return false
+        if (scheme != "http" && scheme != "https") return false
+        val host = uri.host?.lowercase() ?: return false
+        if (host == "liminalselves.top" || host.endsWith(".liminalselves.top")) return true
+
+        val configured = Uri.parse(defaultUrl)
+        return scheme == configured.scheme?.lowercase() &&
+            host == configured.host?.lowercase() &&
+            effectivePort(uri) == effectivePort(configured)
+    }
+
+    private fun effectivePort(uri: Uri): Int =
+        if (uri.port != -1) uri.port else when (uri.scheme?.lowercase()) {
+            "http" -> 80
+            "https" -> 443
+            else -> -1
+        }
+
     private fun handleNavigation(uri: Uri): Boolean {
         val scheme = uri.scheme?.lowercase() ?: return false
         if (scheme in setOf("javascript", "about", "blob", "data")) return false
@@ -1280,16 +1300,13 @@ class NativeWebViewActivity : ComponentActivity() {
             openExternal(uri)
             return true
         }
-        val host = uri.host?.lowercase().orEmpty()
-        if (host == "liminalselves.top" || host.endsWith(".liminalselves.top")) {
-            return false
-        }
+        if (isInternalMisskeyUrl(uri)) return false
         // ContextThemeWrapper 给对话框一个完整的 Material 3 Theme，
         // 隔离 Activity 原有主题，避免 MaterialAlertDialogBuilder 找不到 Material 属性而崩溃。
         val dialogCtx = ContextThemeWrapper(this, dialogHostStyle())
         MaterialAlertDialogBuilder(dialogCtx)
             .setTitle("即将离开站点")
-            .setMessage("当前链接不在 liminalselves.top 域内，将在系统默认浏览器中打开：\n\n${uri}")
+            .setMessage("当前链接不在应用站点内，将在系统默认浏览器中打开：\n\n${uri}")
             .setNegativeButton("取消", null)
             .setPositiveButton("在浏览器中打开") { _, _ -> openExternal(uri) }
             .show()
@@ -1298,17 +1315,16 @@ class NativeWebViewActivity : ComponentActivity() {
 
     /**
      * 处理 window.open() 拦截到的 URL：
-     * 站内域名（liminalselves.top 及其子域名）在当前 WebView 内加载；
-     * 站外域名弹出确认对话框后在系统浏览器打开，避免隐式跳转。
+     * 官方域名及构建注入的实例同源地址在当前 WebView 内加载；
+     * 站外地址弹出确认对话框后在系统浏览器打开，避免隐式跳转。
      * about:blank 等内部协议（前端用于占位窗口等）不触发离站确认，静默忽略。
      */
     private fun handleWindowOpenUrl(rawUrl: String) {
         val uri = Uri.parse(rawUrl)
         val scheme = uri.scheme?.lowercase()
         if (scheme in setOf("about", "javascript", "blob", "data")) return
-        val host = uri.host?.lowercase().orEmpty()
-        if (host == "liminalselves.top" || host.endsWith(".liminalselves.top")) {
-            // 站内域名：在当前 WebView 内打开
+        if (isInternalMisskeyUrl(uri)) {
+            // 站内地址：在当前 WebView 内打开
             webView.loadUrl(rawUrl)
             return
         }
@@ -1316,7 +1332,7 @@ class NativeWebViewActivity : ComponentActivity() {
         val dialogCtx = ContextThemeWrapper(this, dialogHostStyle())
         MaterialAlertDialogBuilder(dialogCtx)
             .setTitle("即将离开站点")
-            .setMessage("当前链接不在 liminalselves.top 域内，将在系统默认浏览器中打开：\n\n${rawUrl}")
+            .setMessage("当前链接不在应用站点内，将在系统默认浏览器中打开：\n\n${rawUrl}")
             .setNegativeButton("取消", null)
             .setPositiveButton("在浏览器中打开") { _, _ -> openExternal(uri) }
             .show()
