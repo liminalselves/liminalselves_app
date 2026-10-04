@@ -566,6 +566,8 @@ class NativeWebViewActivity : ComponentActivity() {
             allowFileAccess = true
             allowContentAccess = true
             mediaPlaybackRequiresUserGesture = false
+            // Page CSS owns font sizing, including icon fonts, independently of Android's font scale.
+            textZoom = 100
             builtInZoomControls = false
             displayZoomControls = false
             setSupportZoom(false)
