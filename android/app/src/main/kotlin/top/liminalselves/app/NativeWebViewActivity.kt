@@ -2053,10 +2053,10 @@ class NativeWebViewActivity : ComponentActivity() {
 
         val targetUrl = openPath?.takeIf { isSafeMisskeyOpenPath(it) }?.let { absoluteUrlForMisskeyPath(it) } ?: currentUrl
 
-        val openIntent = Intent(this, MainActivity::class.java).apply {
-            putExtra("extraMap", JSONObject().put("openUrl", targetUrl).toString())
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
+        val openIntent = MainActivity.createLaunchIntent(
+            this,
+            JSONObject().put("openUrl", targetUrl).toString(),
+        )
         val notificationId = localNotificationSeq++
         val pendingIntent = PendingIntent.getActivity(
             this,
