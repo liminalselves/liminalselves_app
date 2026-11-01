@@ -60,6 +60,6 @@ PR 和未配置签名 secrets 时 APK 使用 debug 签名，只能用于测试�
 
 可选变量（同页 Variables）：`MISSKEY_URL`，覆盖构建内置的实例地址；不设时使用 `android/app/build.gradle.kts` 中的默认正式地址。
 
-`master` 分支保护（Settings → Branches）：要求通过 PR 合并，必需检查选 `android / build`。
+`master` 分支保护（已开启，Settings → Branches）：必须经 PR 合并，必需检查 `build` 通过，对管理员同样生效，禁止强推和删除。
 
 密钥库必须备份：丢失后无法再发出能覆盖安装的更新，用户只能卸载重装。
