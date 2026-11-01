@@ -43,9 +43,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // 任务已在运行（NativeWebViewActivity 位于栈中）时的普通重入（部分 ROM 回前台会
-        // 重新投递启动 Intent）：直接退场露出现有页面，不走红屏门控，也不向
-        // NativeWebViewActivity 重发会导致整页刷新的启动 Intent。通知深链带 extraMap，仍走完整流程。
+        // Ordinary re-entry reveals the existing task, including any permission wizard above WebView.
+        // Notification deep links still pass through the version gate.
         if (!isTaskRoot && intent.getStringExtra("extraMap").isNullOrBlank()) {
             finish()
             return
@@ -53,6 +52,14 @@ class MainActivity : ComponentActivity() {
         overridePendingTransition(0, 0)
         showLoadingView()
         checkVersionAndContinue()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        // A repeated launcher tap must not erase a pending notification destination.
+        if (!intent.getStringExtra("extraMap").isNullOrBlank()) {
+            setIntent(intent)
+        }
     }
 
     private fun showLoadingView() {
@@ -353,6 +360,19 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
+        fun createLaunchIntent(context: Context, extraMap: String? = null): Intent =
+            Intent(context, MainActivity::class.java).apply {
+                action = Intent.ACTION_MAIN
+                addCategory(Intent.CATEGORY_LAUNCHER)
+                // NEW_TASK also looks up an existing task; ordinary re-entry preserves its current UI.
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                if (!extraMap.isNullOrBlank()) {
+                    putExtra("extraMap", extraMap)
+                    // Extras alone do not distinguish this from a launcher tap; force deep-link delivery.
+                    addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                }
+            }
+
         private const val EMBEDDED_UA_MARKER = "LiminalSelvesApp"
         private const val PREFS_UPDATE_GATE = "native_update_gate"
         private const val KEY_META_JSON = "meta_json"

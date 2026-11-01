@@ -1,0 +1,138 @@
+name: android
+
+# develop / master 推送与 PR：编译 APK 并上传为 Actions artifact（无签名 secrets 时用 debug 签名）。
+# 推送 v* 标签：校验 tag 在 master 上且与 pubspec.yaml 版本一致 → 正式签名构建 →
+# Release 说明取自 CHANGELOG.md 对应版本小节 → 附到 GitHub Release。
+on:
+  push:
+    branches: [develop, master]
+    tags: ['v*']
+  pull_request:
+    branches: [develop, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  verify-tag:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: 校验 tag 指向 master
+        run: |
+          git fetch origin master
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "::error::tag ${GITHUB_REF_NAME} 不在 master 分支上"
+            exit 1
+          fi
+      - name: 校验 tag 与 pubspec.yaml 版本一致
+        run: |
+          expected="${GITHUB_REF_NAME#v}"
+          actual="$(sed -nE 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' pubspec.yaml)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::pubspec.yaml 版本 $actual 与 tag $expected 不一致"
+            exit 1
+          fi
+      - name: 校验 CHANGELOG 小节
+        run: python3 scripts/changelog-section.py "${GITHUB_REF_NAME#v}" > /dev/null
+
+  build:
+    needs: verify-tag
+    # verify-tag 只在 tag 上运行；分支构建时它被跳过，build 照常执行
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+          cache-dependency-path: |
+            android/**/*.gradle.kts
+            android/gradle/wrapper/gradle-wrapper.properties
+      # gradlew 脚本未入库，按 wrapper 配置的版本直接安装官方 Gradle
+      - name: 安装 Gradle
+        run: |
+          url="$(sed -nE 's#^distributionUrl=(.*)#\1#p' android/gradle/wrapper/gradle-wrapper.properties | sed 's#\\:#:#')"
+          curl -fsSL "$url" -o "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          echo "$(echo "$RUNNER_TEMP"/gradle-*/bin)" >> "$GITHUB_PATH"
+      - name: 写入签名配置
+        env:
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$STORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+            if [ "$IS_TAG" = "true" ]; then
+              echo "::error::缺少签名 secrets（配置说明见 docs/RELEASE.md）"
+              exit 1
+            fi
+            echo "::warning::未配置签名 secrets，本次 APK 使用 debug 签名，不能覆盖安装正式版"
+            exit 0
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > android/upload-keystore.jks
+          {
+            echo "storeFile=upload-keystore.jks"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > android/key.properties
+      - name: 构建 APK 并检查 lint
+        env:
+          MISSKEY_URL: ${{ vars.MISSKEY_URL }}
+        run: |
+          args=(assembleRelease lintRelease --console=plain)
+          if [ -n "$MISSKEY_URL" ]; then args+=("-PmisskeyUrl=$MISSKEY_URL"); fi
+          gradle -p android "${args[@]}"
+      - name: 整理产物
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            name="LiminalSelves_${GITHUB_REF_NAME}.apk"
+          else
+            version="$(sed -nE 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' pubspec.yaml)"
+            name="LiminalSelves_v${version}-${GITHUB_SHA::7}.apk"
+          fi
+          mkdir -p dist
+          cp build/app/outputs/apk/release/app-release.apk "dist/$name"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: android-apk
+          path: dist
+      - name: 提取版本说明
+        run: python3 scripts/changelog-section.py "${GITHUB_REF_NAME#v}" > release-notes.md
+      - name: 发布 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.apk --clobber
+            gh release edit "$GITHUB_REF_NAME" --notes-file release-notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.apk --notes-file release-notes.md --title "阈界人格 ${GITHUB_REF_NAME#v}"
+          fi

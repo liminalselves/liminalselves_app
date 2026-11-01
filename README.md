@@ -33,6 +33,14 @@ $env:JAVA_HOME="C:\Program Files\Eclipse Adoptium\jdk-21.0.11.10-hotspot"
 .\scripts\gradle-with-jdk.ps1 lintRelease
 ```
 
+## 协作与发布
+
+| 文档 | 内容 |
+| --- | --- |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 分支模型（master / develop / 任务分支）与提交规范 |
+| [docs/RELEASE.md](docs/RELEASE.md) | 版本号、发版步骤、CI 自动构建与签名配置 |
+| [docs/CHANGELOG-GUIDE.md](docs/CHANGELOG-GUIDE.md) | 更新日志书写规范 |
+
 其他平台的 Flutter 检查：
 
 ```powershell
