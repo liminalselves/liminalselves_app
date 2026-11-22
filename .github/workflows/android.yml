@@ -1,12 +1,11 @@
 name: android
 
-# develop / master 推送与 PR：编译 APK 并上传为 Actions artifact（无签名 secrets 时用 debug 签名）。
-# 推送 v* 标签：校验 tag 在 master 上且与 pubspec.yaml 版本一致 → 正式签名构建 →
-# Release 说明取自 CHANGELOG.md 对应版本小节 → 附到 GitHub Release。
+# develop 推送与 PR：编译 APK 并上传为 Actions artifact，用于预发布测试。
+# master 推送（release/hotfix PR 合并）：按 pubspec.yaml 版本自动创建 v<版本> 标签和 GitHub Release，
+# 附正式签名 APK，说明取自 docs/CHANGELOG.md 对应版本小节，并标记为 Latest。
 on:
   push:
     branches: [develop, master]
-    tags: ['v*']
   pull_request:
     branches: [develop, master]
   workflow_dispatch:
@@ -16,37 +15,41 @@ permissions:
 
 concurrency:
   group: android-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  # master 的发布不能被后一次推送中途取消
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+env:
+  IS_RELEASE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
 jobs:
-  verify-tag:
-    if: startsWith(github.ref, 'refs/tags/v')
+  verify-release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: 校验 tag 指向 master
+      - name: 读取版本号
+        id: version
+        run: echo "version=$(sed -nE 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' pubspec.yaml)" >> "$GITHUB_OUTPUT"
+      # 同一版本只发布一次：标签已存在且指向别的提交，说明合并前忘了升版本号
+      - name: 校验版本未发布过
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          git fetch origin master
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
-            echo "::error::tag ${GITHUB_REF_NAME} 不在 master 分支上"
-            exit 1
-          fi
-      - name: 校验 tag 与 pubspec.yaml 版本一致
-        run: |
-          expected="${GITHUB_REF_NAME#v}"
-          actual="$(sed -nE 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' pubspec.yaml)"
-          if [ "$actual" != "$expected" ]; then
-            echo "::error::pubspec.yaml 版本 $actual 与 tag $expected 不一致"
+          existing="$(git rev-parse -q --verify "refs/tags/v$VERSION^{commit}" || true)"
+          if [ -n "$existing" ] && [ "$existing" != "$GITHUB_SHA" ]; then
+            echo "::error::v$VERSION 已发布（$existing），请先在 release 分支升级 pubspec.yaml 版本号"
             exit 1
           fi
       - name: 校验 CHANGELOG 小节
-        run: python3 scripts/changelog-section.py "${GITHUB_REF_NAME#v}" > /dev/null
+        run: python3 scripts/changelog-section.py "${{ steps.version.outputs.version }}" > /dev/null
 
   build:
-    needs: verify-tag
-    # verify-tag 只在 tag 上运行；分支构建时它被跳过，build 照常执行
+    needs: verify-release
+    # verify-release 只在 master 推送时运行；其余场景它被跳过，build 照常执行
     if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
@@ -68,14 +71,13 @@ jobs:
           echo "$(echo "$RUNNER_TEMP"/gradle-*/bin)" >> "$GITHUB_PATH"
       - name: 写入签名配置
         env:
-          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           if [ -z "$KEYSTORE_BASE64" ] || [ -z "$STORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
-            if [ "$IS_TAG" = "true" ]; then
+            if [ "$IS_RELEASE" = "true" ]; then
               echo "::error::缺少签名 secrets（配置说明见 docs/RELEASE.md）"
               exit 1
             fi
@@ -98,10 +100,10 @@ jobs:
           gradle -p android "${args[@]}"
       - name: 整理产物
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            name="LiminalSelves_${GITHUB_REF_NAME}.apk"
+          version="$(sed -nE 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' pubspec.yaml)"
+          if [ "$IS_RELEASE" = "true" ]; then
+            name="LiminalSelves_v${version}.apk"
           else
-            version="$(sed -nE 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' pubspec.yaml)"
             name="LiminalSelves_v${version}-${GITHUB_SHA::7}.apk"
           fi
           mkdir -p dist
@@ -113,11 +115,13 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [verify-release, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      TAG: v${{ needs.verify-release.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -125,14 +129,14 @@ jobs:
           name: android-apk
           path: dist
       - name: 提取版本说明
-        run: python3 scripts/changelog-section.py "${GITHUB_REF_NAME#v}" > release-notes.md
+        run: python3 scripts/changelog-section.py "$TAG" > release-notes.md
+      # 标签由本步骤在当前提交上创建；显式 --latest，仓库首页与 releases/latest 始终指向本次发布
       - name: 发布 GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/*.apk --clobber
-            gh release edit "$GITHUB_REF_NAME" --notes-file release-notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.apk --clobber
+            gh release edit "$TAG" --notes-file release-notes.md --latest
           else
-            gh release create "$GITHUB_REF_NAME" dist/*.apk --notes-file release-notes.md --title "阈界人格 ${GITHUB_REF_NAME#v}"
+            gh release create "$TAG" dist/*.apk --target "$GITHUB_SHA" --notes-file release-notes.md --title "阈界人格 ${TAG#v}" --latest
           fi
+          test "$(gh release view --json tagName -q .tagName)" = "$TAG"

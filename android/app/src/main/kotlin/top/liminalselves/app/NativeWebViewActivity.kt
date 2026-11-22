@@ -88,7 +88,8 @@ class NativeWebViewActivity : ComponentActivity() {
     private lateinit var rootContainer: TopEdgeSwipeRefreshLayout
     private lateinit var webView: WebView
     private lateinit var progressBar: ProgressBar
-    private lateinit var errorOverlay: View
+    /** 错误页按需构建：正常启动不创建这十几个视图，首次加载失败时才生成。 */
+    private var errorOverlay: View? = null
 
     /** 错误页当前构建所用的深浅（与 [pageThemeDark] 不一致时在下次展示前重建）。 */
     private var errorOverlayDark = false
@@ -418,7 +419,7 @@ class NativeWebViewActivity : ComponentActivity() {
 
     /**
      * 普通启动：EXTRA_URL。
-     * 阿里云推送点击（AndroidOpenType=ACTIVITY）：[extraMap] JSON 内含 openUrl。
+     * 系统通知点击（经 MainActivity 版本门控转入）：[extraMap] JSON 内含 openUrl。
      */
     private fun resolveLaunchUrl(incoming: Intent): String {
         incoming.getStringExtra(EXTRA_URL)?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
@@ -861,15 +862,7 @@ class NativeWebViewActivity : ComponentActivity() {
                 dp(2),
             ),
         )
-        errorOverlayDark = pageThemeDark
-        errorOverlay = buildErrorOverlay(pageThemeDark)
-        frame.addView(
-            errorOverlay,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            ),
-        )
+        errorOverlay = null
         rootContainer.addView(
             frame,
             ViewGroup.LayoutParams(
@@ -879,6 +872,8 @@ class NativeWebViewActivity : ComponentActivity() {
         )
         applyShellPalette()
         setContentView(rootContainer)
+        // rootContainer 不透明且铺满窗口，窗口背景只会被整屏覆盖重绘，去掉一层过度绘制。
+        window.setBackgroundDrawable(null)
     }
 
     /** 壳层随站内深浅变化的调色板应用：刷新指示器圆底与顶部进度条轨道。 */
@@ -1364,34 +1359,31 @@ class NativeWebViewActivity : ComponentActivity() {
         view?.stopLoading()
         webView.visibility = View.INVISIBLE
         applySystemBarColor(defaultChromeColor)
-        if (::errorOverlay.isInitialized) {
-            // 站内深浅在错误页构建后变化过：按当前状态重建，保证错误页与站内主题一致。
-            if (errorOverlayDark != pageThemeDark) {
+        // 首次展示或站内深浅在构建后变化过：按当前状态（重新）构建，保证错误页与站内主题一致。
+        val overlay = errorOverlay?.takeIf { errorOverlayDark == pageThemeDark }
+            ?: buildErrorOverlay(pageThemeDark).also { built ->
+                errorOverlay?.let(contentFrame::removeView)
+                errorOverlay = built
                 errorOverlayDark = pageThemeDark
-                contentFrame.removeView(errorOverlay)
-                errorOverlay = buildErrorOverlay(pageThemeDark)
                 contentFrame.addView(
-                    errorOverlay,
+                    built,
                     FrameLayout.LayoutParams(
                         FrameLayout.LayoutParams.MATCH_PARENT,
                         FrameLayout.LayoutParams.MATCH_PARENT,
                     ),
                 )
             }
-            errorUrlText.text = failingUrl
-            errorMetaText.text = formatLoadError(code, description)
-            errorOverlay.visibility = View.VISIBLE
-            errorOverlay.bringToFront()
-        }
+        errorUrlText.text = failingUrl
+        errorMetaText.text = formatLoadError(code, description)
+        overlay.visibility = View.VISIBLE
+        overlay.bringToFront()
     }
 
     private fun hideLoadErrorPage() {
         if (::webView.isInitialized) {
             webView.visibility = View.VISIBLE
         }
-        if (::errorOverlay.isInitialized) {
-            errorOverlay.visibility = View.GONE
-        }
+        errorOverlay?.visibility = View.GONE
         showingErrorPage = false
     }
 
@@ -1978,7 +1970,8 @@ class NativeWebViewActivity : ComponentActivity() {
         webView.evaluateJavascript(js, null)
     }
 
-    private fun injectLiminalAppInfo() {
+    /** 应用信息在进程内不变：只查询一次 PackageManager，之后每次页面加载直接复用脚本。 */
+    private val liminalAppInfoJs: String by lazy {
         val pkg = packageManager.getPackageInfo(packageName, 0)
         val appLabel = packageManager.getApplicationLabel(applicationInfo).toString()
         val map = JSONObject().apply {
@@ -1989,8 +1982,11 @@ class NativeWebViewActivity : ComponentActivity() {
             put("platform", "android")
             put("sdkInt", Build.VERSION.SDK_INT)
         }
-        val js = "window.__LIMINAL_APP_INFO__ = $map; window.dispatchEvent(new CustomEvent('liminal-app-info-updated'));"
-        webView.evaluateJavascript(js, null)
+        "window.__LIMINAL_APP_INFO__ = $map; window.dispatchEvent(new CustomEvent('liminal-app-info-updated'));"
+    }
+
+    private fun injectLiminalAppInfo() {
+        webView.evaluateJavascript(liminalAppInfoJs, null)
     }
 
     private fun areSystemNotificationsEnabled(): Boolean {
@@ -2257,19 +2253,19 @@ class NativeWebViewActivity : ComponentActivity() {
                 if (!isHeld) acquire()
             }
         }.onFailure { Log.w(TAG, "acquire WakeLock failed: ${it.message}") }
-        runCatching {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-            } else {
+        // Android 10+ 只有 WIFI_MODE_FULL_LOW_LATENCY，官方注明它仅在亮屏且应用在前台时生效，
+        // 对后台推送连接没有作用，前台反而会降低吞吐和扫描频率，因此不再申请；
+        // Android 9 及以下的 HIGH_PERF 在息屏后台仍生效，予以保留。
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            runCatching {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
                 @Suppress("DEPRECATION")
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF
-            }
-            wifiLock = wm.createWifiLock(mode, "liminal:ws-wifi").apply {
-                setReferenceCounted(false)
-                if (!isHeld) acquire()
-            }
-        }.onFailure { Log.w(TAG, "acquire WifiLock failed: ${it.message}") }
+                wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "liminal:ws-wifi").apply {
+                    setReferenceCounted(false)
+                    if (!isHeld) acquire()
+                }
+            }.onFailure { Log.w(TAG, "acquire WifiLock failed: ${it.message}") }
+        }
         Log.i(TAG, "Push keep-alive started (persistent)")
     }
 
@@ -2281,11 +2277,16 @@ class NativeWebViewActivity : ComponentActivity() {
                 .setAction(KeepAliveService.ACTION_STOP)
             startService(intent)
         }
+        releaseKeepAliveLocks()
+        Log.i(TAG, "Push keep-alive stopped")
+    }
+
+    private fun releaseKeepAliveLocks() {
+        keepAliveActive = false
         runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
         wakeLock = null
         runCatching { wifiLock?.takeIf { it.isHeld }?.release() }
         wifiLock = null
-        Log.i(TAG, "Push keep-alive stopped")
     }
 
     /**
@@ -2337,10 +2338,14 @@ class NativeWebViewActivity : ComponentActivity() {
         denyPendingWebPermission()
         pushSetupRunning = false
         startupPushDisableRunning = false
-        // 常驻模式：仅 Activity finish（用户退出 App）时停止推送；
-        // 系统回收重建场景不停止，交由 onPause(isFinishing) 处理。
+        // 用户退出 App：停止全部推送。系统重建（深浅色切换等）：只释放本实例的
+        // 连接与锁、保留前台服务，新实例 onResume 会立即接管；否则旧实例的 WS 与
+        // WakeLock/WifiLock 永不释放，每次重建都多一条连接和一把常驻锁。
         if (isFinishing) {
             stopNativePushAll()
+        } else {
+            nativeWsManager.stop()
+            releaseKeepAliveLocks()
         }
         runCatching { unregisterReceiver(downloadCompleteReceiver) }
         filePathCallback?.onReceiveValue(null)
@@ -2362,7 +2367,7 @@ class NativeWebViewActivity : ComponentActivity() {
         const val EXTRA_URL = "extra_url"
         const val EXTRA_UA_MARKER = "extra_ua_marker"
         private const val PREF_NATIVE_PUSH_ENABLED = "flutter.native_push_enabled"
-        /** 与默认主机不同时，用于校验阿里云 extraMap.openUrl 是否可信 */
+        /** 与默认主机不同时，用于校验通知 extraMap.openUrl 是否可信 */
         private const val PREF_LAST_MISSKEY_ORIGIN = "liminal_last_misskey_origin"
         private const val EVENT_NATIVE_PUSH = "liminal-native-push"
         private const val EVENT_NATIVE_PUSH_ALERT = "liminal-native-push-alert"
@@ -2423,6 +2428,8 @@ class NativeWebViewActivity : ComponentActivity() {
          */
         fun cleanupLegacyChannels(context: Context) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+            // 每次页面加载都会做权限检查：遗留渠道删一次即可，避免每次 4 次系统调用。
+            if (!legacyChannelsCleaned.compareAndSet(false, true)) return
             val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             listOf("misskey_push", "misskey_ws_live", "misskey_ws_live_v2", "liminalselves_keepalive").forEach { id ->
                 runCatching { nm.deleteNotificationChannel(id) }
@@ -2435,6 +2442,8 @@ class NativeWebViewActivity : ComponentActivity() {
             ensureChatChannel(context)
             ensureNotifyChannel(context)
         }
+
+        private val legacyChannelsCleaned = java.util.concurrent.atomic.AtomicBoolean(false)
 
         /** 缓存的 Misskey token：供 WebView 暂停后原生 WS 启动兜底使用。 */
         private const val PREF_LAST_MISSKEY_TOKEN = "liminal_last_misskey_token"
