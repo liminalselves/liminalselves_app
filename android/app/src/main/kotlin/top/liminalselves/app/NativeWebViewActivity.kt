@@ -419,7 +419,7 @@ class NativeWebViewActivity : ComponentActivity() {
 
     /**
      * 普通启动：EXTRA_URL。
-     * 阿里云推送点击（AndroidOpenType=ACTIVITY）：[extraMap] JSON 内含 openUrl。
+     * 系统通知点击（经 MainActivity 版本门控转入）：[extraMap] JSON 内含 openUrl。
      */
     private fun resolveLaunchUrl(incoming: Intent): String {
         incoming.getStringExtra(EXTRA_URL)?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
@@ -2367,7 +2367,7 @@ class NativeWebViewActivity : ComponentActivity() {
         const val EXTRA_URL = "extra_url"
         const val EXTRA_UA_MARKER = "extra_ua_marker"
         private const val PREF_NATIVE_PUSH_ENABLED = "flutter.native_push_enabled"
-        /** 与默认主机不同时，用于校验阿里云 extraMap.openUrl 是否可信 */
+        /** 与默认主机不同时，用于校验通知 extraMap.openUrl 是否可信 */
         private const val PREF_LAST_MISSKEY_ORIGIN = "liminal_last_misskey_origin"
         private const val EVENT_NATIVE_PUSH = "liminal-native-push"
         private const val EVENT_NATIVE_PUSH_ALERT = "liminal-native-push-alert"

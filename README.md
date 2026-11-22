@@ -33,7 +33,7 @@ $env:JAVA_HOME="C:\Program Files\Eclipse Adoptium\jdk-21.0.11.10-hotspot"
 .\android\gradlew.bat assembleRelease -PmisskeyUrl=http://47.79.85.42:8888/
 ```
 
-产物位于 `build/app/outputs/apk/release/app-release.apk`（约 1.6 MB）。lint：`.\scripts\gradle-with-jdk.ps1 lintRelease`。
+产物位于 `build/app/outputs/apk/release/app-release.apk`（约 1.4 MB）。lint：`.\scripts\gradle-with-jdk.ps1 lintRelease`。
 
 其他平台的 Flutter 检查：
 
@@ -56,12 +56,12 @@ flutter test
 ```json
 {
   "nativeClientAppInfo": {
-    "latestAndroidVersion": "1.0.0",
+    "latestAndroidVersion": "0.1.1",
     "androidDownloadUrl": "…下载地址…",
     "minRequiredAppVersion": "0.1.9",
     "changelog": [],
     "androidReleases": [
-      { "minSdk": 24, "version": "1.0.0", "downloadUrl": "…同上…" }
+      { "minSdk": 24, "version": "0.1.1", "downloadUrl": "…同上…" }
     ]
   }
 }
