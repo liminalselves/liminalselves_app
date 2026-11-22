@@ -56,12 +56,12 @@ flutter test
 ```json
 {
   "nativeClientAppInfo": {
-    "latestAndroidVersion": "0.1.1",
+    "latestAndroidVersion": "1.1.0",
     "androidDownloadUrl": "…下载地址…",
     "minRequiredAppVersion": "0.1.9",
     "changelog": [],
     "androidReleases": [
-      { "minSdk": 24, "version": "0.1.1", "downloadUrl": "…同上…" }
+      { "minSdk": 24, "version": "1.1.0", "downloadUrl": "…同上…" }
     ]
   }
 }
