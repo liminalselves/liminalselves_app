@@ -17,7 +17,7 @@
 ## 提交与拉取请求
 
 - 提交信息和 PR 标题使用中文 Conventional Commit 前缀：`feat:`、`fix:`、`perf:`、`refactor:`、`style:`、`docs:`、`test:`、`chore:`。
-- 改动影响用户可见的行为时，同一个提交或 PR 里更新 `docs/CHANGELOG.md` 顶部的待发版本小节，写法见 [CHANGELOG-GUIDE.md](CHANGELOG-GUIDE.md)。
+- 改动影响用户可见的行为时，同一个提交或 PR 里更新 `docs/CHANGELOG.md` 顶部的 `## [Unreleased]` 小节，写法见 [CHANGELOG-GUIDE.md](CHANGELOG-GUIDE.md)。
 - 推送到 `develop` / `master` 或向它们发起 PR 时，CI 会编译 APK 并跑 lint，失败时先修复再合并。产物在 Actions 运行页下载。
 
 ## 文档位置

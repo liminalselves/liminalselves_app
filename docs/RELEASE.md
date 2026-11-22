@@ -6,9 +6,11 @@
 
 | 触发 | 行为 |
 | --- | --- |
-| 推送 `develop` / `master`，或向它们发起 PR | 编译 release APK 并跑 `lintRelease`，APK 作为 artifact 上传（`LiminalSelves_v<版本>-<提交>.apk`），用于预发布测试 |
-| 推送 `v*` 标签 | 校验标签在 `master` 上、与 `pubspec.yaml` 版本一致、`docs/CHANGELOG.md` 有对应小节 → 正式签名构建 → 创建 GitHub Release 并附 `LiminalSelves_v<版本>.apk`，说明取自 CHANGELOG 小节，显式标记为 Latest |
-| Actions 页手动运行 | 同分支构建 |
+| 推送 `develop`，或向 `develop` / `master` 发起 PR | 编译 release APK 并跑 `lintRelease`，APK 作为 artifact 上传（`LiminalSelves_v<版本>-<提交>.apk`），用于预发布测试 |
+| 推送 `master`（release/hotfix PR 合并） | 校验版本未发布过、CHANGELOG 有对应小节 → 正式签名构建 → 在当前提交创建 `v<版本>` 标签和 GitHub Release，附 `LiminalSelves_v<版本>.apk`，说明取自 CHANGELOG 小节并标记为 Latest |
+| Actions 页手动运行 | 同分支构建，不发布 |
+
+`master` 推送即发布：CI 读取 `pubspec.yaml` 版本号，如果对应 tag 已存在且指向别的提交（说明合并前忘了升版本号），会在构建前就失败。不再需要手动打 tag。
 
 PR 构建同样使用正式签名（secrets 对本仓库分支可见；来自 fork 的 PR 拿不到 secrets，会退回 debug 签名并给出警告）。
 
@@ -26,7 +28,7 @@ PR 构建同样使用正式签名（secrets 对本仓库分支可见；来自 fo
 
 前提：位于 `develop`，用户明确要求「做发布前准备」。
 
-1. **版本号与更新日志**：从 `develop` 拉出 `release/v<版本>`；改 `pubspec.yaml` 的 `version`（versionCode +1）；按 [CHANGELOG-GUIDE.md](CHANGELOG-GUIDE.md) 整理 `docs/CHANGELOG.md` 顶部小节，标题为 `## <版本>`。
+1. **版本号与更新日志**：从 `develop` 拉出 `release/v<版本>`；改 `pubspec.yaml` 的 `version`（versionCode +1）；按 [CHANGELOG-GUIDE.md](CHANGELOG-GUIDE.md) 把 `docs/CHANGELOG.md` 的 Unreleased 内容整理进 `## [<版本>] - <当天日期>` 小节，并更新底部链接。
 2. **校对文档**：README 与 `docs/` 中的构建命令、版本、行为说明与代码一致；文档只放在 `docs/`（README 除外）。
 3. **清理仓库**：删除无用代码、死资源、临时脚本和调试残留。
 4. **提交与 PR**：提交（中文 Conventional Commit），推送 release 分支，向 `master` 开 PR，标题 `chore: 发布 v<版本>`，正文用 CHANGELOG 小节；等 CI 全部通过，失败就修复后重推。
@@ -37,23 +39,14 @@ PR 构建同样使用正式签名（secrets 对本仓库分支可见；来自 fo
 前提：用户明确下达「发布」。
 
 1. **合并 PR**：确认 CI 仍为通过，用 merge commit 合并（不 squash，保留 develop 历史）。
-2. **打标签**：在 `master` 的合并提交上打标签并推送，CI 自动构建并创建 Release：
-
-   ```powershell
-   git switch master
-   git pull --ff-only
-   git tag -a v1.0.0 -m "v1.0.0"
-   git push origin v1.0.0
-   ```
-
-   等发版 CI 结束，确认 Release 附有 APK、仓库首页显示的 Latest 是这个版本（CI 用 `--latest` 显式标记，并在最后一步校验）。
+2. **等发版 CI**：master 推送自动校验版本、正式签名构建并创建 `v<版本>` 标签和 GitHub Release；确认 Release 附有 APK 且仓库首页的 Latest 指向它。
 3. **基线统一**：把 `master` 合回 `develop` 并推送（正常情况下是快进），删除本地和远端的 release 分支。
 
 发布后如需应用内提示更新：在服务端 `nativeClientAppInfo` 填写新版本号与 Release 中的 APK 下载地址（字段见 [README.md](../README.md#服务端更新元数据)）。
 
 紧急修复走 `hotfix/v<版本>`，从 `master` 拉出，其余步骤相同，发布后同样合回 `develop`。
 
-Release 说明写错：直接在 GitHub 上编辑，同时改 CHANGELOG 保持一致。已对外发布的标签不重用。
+Release 说明写错：直接在 GitHub 上编辑，同时改 CHANGELOG 保持一致。已对外发布的标签不重用；同一版本重复推送 master 会因「版本已发布」校验失败，如需重发必须先升版本号。
 
 ## 仓库配置（已完成）
 
