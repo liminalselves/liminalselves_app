@@ -106,10 +106,7 @@ class MainActivity : ComponentActivity() {
         ioExecutor.execute {
             val freshJson = fetchMeta()
             if (freshJson != null) {
-                prefs.edit()
-                    .putString(cacheKey, freshJson)
-                    .putLong(KEY_META_SAVED_AT, System.currentTimeMillis())
-                    .apply()
+                prefs.edit().putString(cacheKey, freshJson).apply()
             }
             runOnUiThread {
                 if (isFinishing || isDestroyed) return@runOnUiThread
@@ -129,10 +126,7 @@ class MainActivity : ComponentActivity() {
         ioExecutor.execute {
             val freshJson = fetchMeta()
             if (freshJson != null) {
-                prefs.edit()
-                    .putString(cacheKey, freshJson)
-                    .putLong(KEY_META_SAVED_AT, System.currentTimeMillis())
-                    .apply()
+                prefs.edit().putString(cacheKey, freshJson).apply()
             }
         }
     }
@@ -157,7 +151,11 @@ class MainActivity : ComponentActivity() {
                 it.write("""{"detail":false}""".toByteArray(Charsets.UTF_8))
             }
             if (connection.responseCode !in 200..299) return null
-            connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val meta = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            // 完整 meta 约 20 KB，门控只用 nativeClientAppInfo（约 3 KB）。只缓存这一段：
+            // 冷启动时主线程读取偏好文件与解析 JSON 的数据量都小一个数量级。
+            val nativeInfo = JSONObject(meta).optJSONObject("nativeClientAppInfo")
+            JSONObject().apply { if (nativeInfo != null) put("nativeClientAppInfo", nativeInfo) }.toString()
         } catch (_: Exception) {
             null
         } finally {
@@ -376,7 +374,6 @@ class MainActivity : ComponentActivity() {
         private const val EMBEDDED_UA_MARKER = "LiminalSelvesApp"
         private const val PREFS_UPDATE_GATE = "native_update_gate"
         private const val KEY_META_JSON = "meta_json"
-        private const val KEY_META_SAVED_AT = "meta_saved_at"
         private const val META_CONNECT_TIMEOUT_MS = 2_500
         private const val META_READ_TIMEOUT_MS = 2_500
         private const val APP_ACCENT_COLOR = -15043608

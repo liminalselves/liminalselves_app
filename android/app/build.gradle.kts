@@ -53,6 +53,12 @@ android {
         buildConfig = true
     }
 
+    androidResources {
+        // 应用界面只有中文：去掉 AndroidX / Material 自带的其余几十种语言翻译，
+        // 缩小 resources.arsc，减少安装体积与资源表加载开销。默认（英文）资源始终保留作兜底。
+        localeFilters += listOf("zh-rCN", "zh-rHK", "zh-rTW")
+    }
+
     lint {
         // Flutter 工具会以未转义的 Windows 路径重写 local.properties；原生构建不再读取该文件。
         disable += "PropertyEscape"
