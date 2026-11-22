@@ -2,7 +2,7 @@ name: android
 
 # develop / master 推送与 PR：编译 APK 并上传为 Actions artifact（无签名 secrets 时用 debug 签名）。
 # 推送 v* 标签：校验 tag 在 master 上且与 pubspec.yaml 版本一致 → 正式签名构建 →
-# Release 说明取自 CHANGELOG.md 对应版本小节 → 附到 GitHub Release。
+# Release 说明取自 docs/CHANGELOG.md 对应版本小节 → 附到 GitHub Release。
 on:
   push:
     branches: [develop, master]
@@ -126,13 +126,15 @@ jobs:
           path: dist
       - name: 提取版本说明
         run: python3 scripts/changelog-section.py "${GITHUB_REF_NAME#v}" > release-notes.md
+      # 显式 --latest：仓库首页与 releases/latest 始终指向本次发布，不依赖 GitHub 按日期/版本的自动判定
       - name: 发布 GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/*.apk --clobber
-            gh release edit "$GITHUB_REF_NAME" --notes-file release-notes.md
+            gh release edit "$GITHUB_REF_NAME" --notes-file release-notes.md --latest
           else
-            gh release create "$GITHUB_REF_NAME" dist/*.apk --notes-file release-notes.md --title "阈界人格 ${GITHUB_REF_NAME#v}"
+            gh release create "$GITHUB_REF_NAME" dist/*.apk --notes-file release-notes.md --title "阈界人格 ${GITHUB_REF_NAME#v}" --latest
           fi
+          test "$(gh release view --json tagName -q .tagName)" = "$GITHUB_REF_NAME"

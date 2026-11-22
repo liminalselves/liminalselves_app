@@ -1,6 +1,6 @@
 # 更新记录
 
-<!-- 面向用户：每个版本小节会原样作为 GitHub Release 说明。书写规范见 docs/CHANGELOG-GUIDE.md。1.0.0 之前的记录保留旧格式，不再改写。 -->
+<!-- 面向用户：每个版本小节会原样作为 GitHub Release 说明。书写规范见 CHANGELOG-GUIDE.md。1.0.0 之前的记录保留旧格式，不再改写。 -->
 
 ## 1.0.0
 

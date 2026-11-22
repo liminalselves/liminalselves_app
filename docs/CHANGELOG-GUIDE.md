@@ -1,6 +1,6 @@
 # 更新日志书写规范
 
-`CHANGELOG.md` 写给用户看。每个版本小节会由发版 CI 原样截取为 GitHub Release 说明（见 [RELEASE.md](RELEASE.md)），也可以照抄到服务端的应用内更新日志。技术细节写进提交记录和文档，不进 CHANGELOG。
+`docs/CHANGELOG.md` 写给用户看。每个版本小节会由发版 CI 原样截取为 GitHub Release 说明（见 [RELEASE.md](RELEASE.md)），也可以照抄到服务端的应用内更新日志。技术细节写进提交记录和文档，不进 CHANGELOG。
 
 ## 结构
 
