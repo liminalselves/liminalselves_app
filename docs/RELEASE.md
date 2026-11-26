@@ -28,7 +28,7 @@ PR 构建同样使用正式签名（secrets 对本仓库分支可见；来自 fo
 
 前提：位于 `develop`，用户明确要求「做发布前准备」。
 
-1. **版本号与更新日志**：从 `develop` 拉出 `release/v<版本>`；改 `pubspec.yaml` 的 `version`（versionCode +1）；按 [CHANGELOG-GUIDE.md](CHANGELOG-GUIDE.md) 把 `docs/CHANGELOG.md` 的 Unreleased 内容整理进 `## [<版本>] - <当天日期>` 小节，并更新底部链接。
+1. **版本号与更新日志**：从 `develop` 拉出 `release/v<版本>`；改 `pubspec.yaml` 的 `version`（versionCode +1）；按 [CHANGELOG-GUIDE.md](CHANGELOG-GUIDE.md) 把 `docs/CHANGELOG.md` 的 Unreleased 内容整理进 `## [<版本>] - <当天日期>` 小节，并更新底部链接；可本地执行 `python3 scripts/changelog-section.py <版本>` 校验格式。
 2. **校对文档**：README 与 `docs/` 中的构建命令、版本、行为说明与代码一致；文档只放在 `docs/`（README 除外）。
 3. **清理仓库**：删除无用代码、死资源、临时脚本和调试残留。
 4. **提交与 PR**：提交（中文 Conventional Commit），推送 release 分支，向 `master` 开 PR，标题 `chore: 发布 v<版本>`，正文用 CHANGELOG 小节；等 CI 全部通过，失败就修复后重推。
@@ -65,7 +65,7 @@ Release 说明写错：直接在 GitHub 上编辑，同时改 CHANGELOG 保持�
 base64 -w0 upload-keystore.jks | gh secret set ANDROID_KEYSTORE_BASE64
 ```
 
-可选变量（同页 Variables）：`MISSKEY_URL`，覆盖构建内置的实例地址；不设时用 `android/app/build.gradle.kts` 中的默认正式地址。
+可选变量（同页 Variables）：`MISSKEY_URL`，覆盖构建内置的实例地址；不设时用 `android/app/build.gradle.kts` 中的默认正式地址（`https://misskey.liminalselves.top/`）。
 
 `master` 分支保护：必须经 PR 合并，必需检查 `build` 通过，对管理员同样生效，禁止强推和删除。
 

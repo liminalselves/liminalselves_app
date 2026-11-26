@@ -17,21 +17,23 @@
 ### 1.1 启动版本检查
 
 - 正常冷启动时，`MainActivity` 必须向 `BuildConfig.MISSKEY_URL` 对应的 `/api/meta` 读取版本策略；`-PmisskeyUrl=...` 同时决定 WebView 地址和版本检查地址。
-- 同一实例已有缓存时可先按缓存快速进入并后台刷新；首次启动或切换构建注入的实例地址时必须等待该实例返回，开发包与正式包不得互用策略缓存。
-- 当前版本低于 `minRequiredAppVersion` 时阻断进入 WebView；未低于最低版本但低于 `latestAndroidVersion` 时，启动时显示可关闭的更新提示及下载入口。
+- 同一实例已有缓存时（仅缓存 `nativeClientAppInfo` 片段）可先按缓存快速进入并后台刷新；首次启动或切换构建注入的实例地址时必须等待该实例返回，开发包与正式包不得互用策略缓存。
+- 支持通过 `androidReleases` 按系统 `minSdk` / `maxSdk` 分流下发独立的 `version`、`minRequiredVersion`、`downloadUrl`、`changelog`，未配置或未命中时回退顶层 `minRequiredAppVersion`、`latestAndroidVersion`、`androidDownloadUrl`、`changelog`。
+- 当前版本低于最低要求版本时阻断进入 WebView；未低于最低版本但低于最新版本时，启动时显示可关闭的更新提示及下载入口。
 
-## 2. Web → Android 桥
+## 2. Web ↔ Android 桥
 
 | 桥 | 方法 | 说明 |
 |---|---|---|
-| `AppNativePush` | `postMessage('enable'|'disable'|'query')` | 推送开关 |
+| `AppNativePush` | `postMessage('enable'\|'disable'\|'query')` | 推送开关（历史 `{action:"notify"}` 已废弃并静默忽略） |
 | `AppChrome` | `postColor(cssColor)` | Misskey 已应用主题的页面背景色，不是服务端初始强调色 |
 | `AppNav` | `onRouteChange(json)` | `{ fullPath, route }`，同步当前地址 |
-| `AppDownload` | `onBlobReady/onBlobError` | blob 下载 |
+| `AppDownload` | `onBlobReady(base64, fileName, mimeType)` / `onBlobError(error)` | blob 下载 |
 
 Android → Web：
 
-- `liminal-native-push`：推送开关状态；
+- `window.__LIMINAL_APP_INFO__` 与 `liminal-app-info-updated`：页面加载完成时注入 `{ appName, version, buildNumber, packageName, platform, sdkInt }`（供站内核对客户端信息；iOS 端注入前 5 个字段）；
+- `liminal-native-push`：推送开关状态，`detail` 为 `{ registered: boolean, errorCode?: string, errorMessage?: string }`；
 - `liminal-native-push-alert`：启动检查发现权限不完整、已自动关闭推送时的说明。
 
 ## 3. Misskey Streaming
@@ -101,15 +103,17 @@ Android → Web：
 ## 8. 系统通知
 
 - App 内有 started Activity 时抑制系统通知，避免站内提示和系统 Heads-up 重复。
-- 整个 App 不可见时，由原生 WS 发送系统通知。
-- 账号 token/origin 变化时原生 WS 必须重连，旧 socket 回调不得恢复旧连接。
+- 整个 App 不可见时，由原生 WS 订阅 `main` 频道发送系统通知，覆盖 `notification`（帖子/提及/回复/引用/转发/反应/关注/关注请求/投票结束）、`newChatMessage`（私信 `/chat/user/<id>`、群聊 `/chat/room/<id>`）与 `newAgentMessage`（智能体消息 `/chat/agent/<id>`）。
+- 通知分级：`openPath` 以 `/chat` 开头的消息（含私信、群聊、智能体消息）走高优先级私信渠道 `misskey_chat_v2`（弹窗 + 声音 + 震动）；其余互动通知走低优先级互动渠道 `misskey_notify_v2`（静默）；前台保活走 `liminalselves_keepalive_v2`（最低优先级）。
+- 账号 token/origin 变化时原生 WS 必须重连，旧 socket 回调不得恢复旧连接；系统重建 Activity 时须释放旧实例的 WS 连接与保活锁，避免重复连接。
 
 ## 9. 下载与外链
 
 - 下载开始：前台 Toast「开始下载：<文件名>」（HTTP/blob/data 一致）。
-- 下载完成：不自动打开文件；前台单条 Toast「已保存到 Download/: <文件名>」；后台发静默系统通知（复用互动通知渠道），点击通知打开文件。
-- HTTP 下载保留 DownloadManager 下载中进度通知。
-- `about:blank` 等内部协议不触发离站确认。
+- 存储位置与权限：三类下载统一写入公共 `Download/` 目录（HTTP 经 `DownloadManager`；`blob:` 优先读取注入 shim 缓存的 Blob 引用并回退 `fetch`；`data:` 解码落盘）；Android 10+ 经 `MediaStore.Downloads` 写入免存储权限，Android 9 及以下先申请 `WRITE_EXTERNAL_STORAGE` 再执行下载。
+- 下载完成：不自动打开文件；前台单条 Toast「已保存到 Download/: <文件名>」；后台发静默系统通知（复用 `misskey_notify_v2` 渠道），点击通知打开文件。
+- HTTP 下载保留 `DownloadManager` 下载中进度通知。
+- `about:`、`javascript:`、`blob:`、`data:` 等内部协议不触发离站确认；非 HTTP(S) 自定义 scheme 直接交由系统处理。
 - 官方 `liminalselves.top` 域及 `-PmisskeyUrl=...` 注入实例的同源地址（协议、主机、端口均一致）在 WebView 内打开；其余 HTTP(S) 地址先确认再交给系统浏览器。
 - 外链无法打开时必须显示错误。
 
